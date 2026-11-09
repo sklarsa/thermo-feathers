@@ -1,0 +1,59 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/README.md"
+      - "SPEC.md"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        action:
+          - command: build
+            args: --release
+          - command: fmt
+            args: --all -- --check
+          - command: clippy
+            args: --release -- -D warnings
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Setup Rust
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: false
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+      - name: Run command
+        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: sklarsa/qwp-embedded
+          ref: 7ff4370dd121c549be8196fe0aa2c0906a5bd1d1 # keep in step with Cargo.toml
+          path: qwp-embedded
+      - uses: dtolnay/rust-toolchain@stable
+      # +stable: rust-toolchain.toml pins the Xtensa toolchain
+      - run: |
+          rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded qwp-embedded/src/lib.rs -o libqwp_embedded.rlib
+          rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=libqwp_embedded.rlib -o room-tests && ./room-tests

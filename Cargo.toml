@@ -1,0 +1,28 @@
+[package]
+edition      = "2024"
+name         = "room-node"
+rust-version = "1.95"
+version      = "0.1.0"
+license      = "MIT"
+
+[[bin]]
+name = "room-node"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal                = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
+esp-backtrace          = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-println            = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+log                    = "0.4.27"
+qwp-embedded = { git = "https://github.com/sklarsa/qwp-embedded", rev = "7ff4370dd121c549be8196fe0aa2c0906a5bd1d1" }
+
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = 'fat'
+opt-level     = 's'
