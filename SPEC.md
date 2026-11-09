@@ -152,7 +152,7 @@ firmware image, so OTA images carry no secrets and every node runs the identical
   MANIFEST_URL and the NTP server (default pool.ntp.org). A host script builds it from environment
   variables, and it's written at first flash with espflash's write-to-offset command. The firmware
   only reads it. Changing Wi-Fi means re-writing it over USB.
-- **Hostname:** set `roomnode-<id>` (e.g. `roomnode-a1b2c3`) as the hostname in embassy-net's
+- **Hostname:** set `thermo-feather-<id>` (e.g. `thermo-feather-a1b2c3`) as the hostname in embassy-net's
   DhcpConfig, so the router lists each sensor by the same ID shown in QuestDB. The router learns it
   on the first full DHCP request.
 - **Fixed addresses come from the router, never the firmware.** Reserve an IP for each sensor in
@@ -267,7 +267,7 @@ come from a manifest on a local web server.
 {
   "firmware": {
     "version": "1.1.0",
-    "url": "http://192.168.1.10:8080/fw/room-node-1.1.0.bin",
+    "url": "http://192.168.1.10:8080/fw/thermo-feathers-1.1.0.bin",
     "sha256": "<hex>",
     "size": 1048576
   },
@@ -395,7 +395,7 @@ A new no_std Rust project on the same stack as s3-sensors: esp-hal 1.2, Embassy,
 embassy-net. Logic that doesn't touch hardware lives in `lib.rs` so it can be tested on the host.
 
 ```
-room-node/
+thermo-feathers/
   Cargo.toml
   rust-toolchain.toml
   build.rs

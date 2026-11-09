@@ -14,7 +14,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     let _peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz));
-    info!("room-node {}", env!("CARGO_PKG_VERSION"));
+    info!("thermo-feathers {}", env!("CARGO_PKG_VERSION"));
     let delay = Delay::new();
     loop {
         delay.delay_millis(60_000);

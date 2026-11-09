@@ -1,4 +1,4 @@
-# room-node
+# thermo-feathers
 
 `no_std` Rust firmware for battery-powered room temperature and humidity nodes: an Adafruit
 ESP32-S3 Feather with an SHT41 on STEMMA QT wakes every minute, buffers readings in RTC memory
@@ -34,7 +34,7 @@ The logic in `src/lib.rs` runs on the host against a checkout of qwp-embedded ne
 
 ```sh
 rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib
-rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp_embedded.rlib -o /tmp/room-tests && /tmp/room-tests
+rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp_embedded.rlib -o /tmp/thermo-tests && /tmp/thermo-tests
 ```
 
 ## Departures from the spec
