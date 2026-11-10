@@ -73,6 +73,12 @@ static QWP_STATS: Stats = Stats::new();
 
 type Shared = &'static SharedRing<Rec>;
 
+/// A panic reboots: the gateway is on wall power, and a reboot loses only what QuestDB hadn't acked.
+#[unsafe(no_mangle)]
+fn custom_halt() -> ! {
+    esp_hal::system::software_reset()
+}
+
 fn now_us() -> i64 {
     Instant::now().as_micros() as i64 + critical_section::with(|cs| OFFSET_US.borrow(cs).get())
 }
@@ -153,6 +159,7 @@ async fn main(spawner: Spawner) -> ! {
 /// Answers every node: Hello to Discover, Reply to Data once its records are in the ring.
 async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
     let mut nodes = Nodes::new();
+    let fw_unknown = SYMBOLS.intern("?").unwrap();
     let mut buf = [0u8; FRAME_MAX];
     loop {
         let r = esp.receive_async().await;
@@ -179,19 +186,19 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                 };
                 let fw_len = status.fw.iter().position(|&b| b == 0).unwrap_or(12);
                 let fw = core::str::from_utf8(&status.fw[..fw_len]).unwrap_or("?");
-                let (Some(dev), Some(fw)) = (SYMBOLS.intern(id_str(&id)), SYMBOLS.intern(fw))
-                else {
-                    warn!("symbol table full: {} ignored", id_str(&id));
+                let Some(dev) = SYMBOLS.intern(id_str(&id)) else {
+                    warn!("symbol table full: new node {} ignored", id_str(&id));
                     continue;
                 };
+                // A full table only costs a new version its name, never the node its data
+                let fw = SYMBOLS.intern(fw).unwrap_or_else(|| {
+                    warn!("symbol table full: {} fw {fw} logged as ?", id_str(&id));
+                    fw_unknown
+                });
                 (node.dev, node.fw) = (dev as u16, fw as u16);
-                let t_us = if status.t_us > 0 {
-                    status.t_us
-                } else if SYNCED.load(Relaxed) {
-                    now_us()
-                } else {
-                    0 // neither side knows the time: skip the status row
-                };
+                // The node's time at wake: the same in every frame and retry of a wake, so
+                // QuestDB's dedup keeps one row. A node without time yet gets none.
+                let t_us = status.t_us;
                 let rssi = r.info.rx_control.rssi;
                 let channel = r.info.rx_control.channel as u8;
                 let status = (t_us > 0).then_some(Status {
@@ -264,7 +271,22 @@ async fn connection(mut controller: WifiController<'static>) {
                     WIFI_CHANNEL.store(ap.channel as u32, Relaxed);
                 }
                 info!("wifi connected, channel {}", WIFI_CHANNEL.load(Relaxed));
-                let gone = controller.wait_for_disconnect_async().await;
+                // The AP can move channel without disconnecting us (it did on 2026-11-03)
+                let gone = loop {
+                    if let Ok(r) = with_timeout(
+                        Duration::from_secs(10),
+                        controller.wait_for_disconnect_async(),
+                    )
+                    .await
+                    {
+                        break r;
+                    }
+                    if let Ok(ap) = controller.ap_info()
+                        && WIFI_CHANNEL.swap(ap.channel as u32, Relaxed) != ap.channel as u32
+                    {
+                        info!("wifi channel now {}", ap.channel);
+                    }
+                };
                 WIFI_CHANNEL.store(0, Relaxed);
                 warn!("wifi disconnected: {gone:?}");
             }

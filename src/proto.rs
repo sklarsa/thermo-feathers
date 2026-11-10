@@ -23,7 +23,7 @@ const REPLY_LEN: usize = HEADER + 2 + 1 + 8 + 2 + 1;
 /// Everything a node reports about itself, once per frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NodeStatus {
-    /// The node's epoch time at wake, 0 if it has none yet.
+    /// The node's epoch time at wake, the same in every frame of a wake; 0 if it has none yet.
     pub t_us: i64,
     pub battery_v: f32,
     pub battery_pct: f32,

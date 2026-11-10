@@ -74,6 +74,28 @@ unsafe impl esp_hal::Persistable for State {}
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut STATE: State = unsafe { core::mem::zeroed() };
 
+/// Recorded as `reset_reason` after a panic. esp-hal's SocResetReason values stay below this.
+const PANIC_REASON: u32 = 255;
+
+/// A panic sleeps the node for a wake interval instead of hanging it awake: the wake after is an
+/// ordinary deep-sleep wake, so the RTC ring survives, and a panic on every boot costs one wake a
+/// minute rather than a reboot loop. device_status shows it as reset_reason 255.
+#[unsafe(no_mangle)]
+fn custom_halt() -> ! {
+    // SAFETY: we're dying; nothing else will touch STATE or LPWR again
+    unsafe {
+        let st = &mut *core::ptr::addr_of_mut!(STATE);
+        if st.magic == MAGIC {
+            st.reset_reason = PANIC_REASON;
+        }
+        let mut lp = LowPower::new(esp_hal::peripherals::LPWR::steal());
+        lp.set_wakeup_deadline(
+            esp_hal::time::Instant::now() + esp_hal::time::Duration::from_secs(WAKE_S as u64),
+        );
+        lp.sleep_deep(RtcSleepConfig::deep())
+    }
+}
+
 #[esp_rtos::main]
 async fn main(_spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
@@ -156,7 +178,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let controller =
             WifiController::new(peripherals.WIFI, ControllerConfig::default()).unwrap();
         let mut esp = controller.esp_now();
-        radio(&mut esp, st, &rtc_us).await;
+        radio(&mut esp, st, &rtc_us, woke_us).await;
     }
 
     // Sleep to a fixed cadence so wake length doesn't drift the samples.
@@ -192,8 +214,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
 /// Talk to the gateway where it was last heard; if it doesn't answer, look for it on every
 /// channel, backing off 1, 2, 4… wakes (up to an hour) after sweeps that find nothing.
-async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) {
-    if st.gw_channel != 0 && exchange(esp, st, rtc_us).await {
+async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64, woke_us: i64) {
+    if st.gw_channel != 0 && exchange(esp, st, rtc_us, woke_us).await {
         st.sweep_failures = 0;
         st.wakes_to_sweep = 0;
         return;
@@ -203,7 +225,7 @@ async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) {
         warn!("no gateway; next sweep in {} wakes", st.wakes_to_sweep);
         return;
     }
-    if sweep(esp, st).await && exchange(esp, st, rtc_us).await {
+    if sweep(esp, st).await && exchange(esp, st, rtc_us, woke_us).await {
         st.sweep_failures = 0;
         st.wakes_to_sweep = 0;
         return;
@@ -224,7 +246,12 @@ async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) {
 /// Sends frames of samples until the ring has nothing sendable left, the gateway stops answering,
 /// or RADIO_CAP runs out. Returns whether the gateway answered at all. The first frame may carry no
 /// samples: before the first reply nothing has a real timestamp.
-async fn exchange(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) -> bool {
+async fn exchange(
+    esp: &mut EspNow,
+    st: &mut State,
+    rtc_us: &impl Fn() -> i64,
+    woke_us: i64,
+) -> bool {
     if esp.set_channel(st.gw_channel).is_err() {
         return false;
     }
@@ -251,10 +278,12 @@ async fn exchange(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) -
         let mut fw = [0u8; 12];
         fw[..FW.len().min(12)].copy_from_slice(&FW.as_bytes()[..FW.len().min(12)]);
         let status = NodeStatus {
+            // One time per wake: every frame and retry of this wake is the same device_status
+            // row, which QuestDB's (ts, device) dedup collapses to the last.
             t_us: if st.clock.synced == 0 {
                 0
             } else {
-                st.clock.epoch_us(rtc_us())
+                st.clock.epoch_us(woke_us)
             },
             battery_v: st.battery_v,
             battery_pct: st.battery_pct,
