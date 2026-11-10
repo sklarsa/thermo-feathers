@@ -2,7 +2,7 @@
 edition      = "2024"
 name         = "thermo-feathers"
 rust-version = "1.95"
-version      = "0.2.0"
+version      = "0.3.0"
 license      = "MIT"
 
 [[bin]]
@@ -38,3 +38,7 @@ codegen-units = 1
 debug         = 2
 lto           = 'fat'
 opt-level     = 's'
+
+# ponytail: dev only, until qwp-embedded 71b14b0 is pushed; then pin rev and delete
+[patch."https://github.com/sklarsa/qwp-embedded"]
+qwp-embedded = { path = "../qwp-embedded" }

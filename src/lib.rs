@@ -17,10 +17,6 @@ pub const SHT41_MEASURE: u8 = 0xFD;
 pub const MAX17048: u8 = 0x36;
 pub const LC709203F: u8 = 0x0B;
 
-/// Symbol dictionary: the sender registers `[device, fw_version]` on each connection.
-const SYM_DEVICE: u64 = 0;
-const SYM_FW: u64 = 1;
-
 pub const RING_LEN: usize = 256; // ~4 h at 60 s
 
 /// Sensirion CRC-8: polynomial 0x31, init 0xFF.
@@ -258,11 +254,23 @@ pub fn wakes_to_next_send(send_every: u32, failures: u32, wake_s: u32) -> u32 {
     (send_every << failures.min(16)).min(cap.max(send_every))
 }
 
-/// Everything QuestDB gets: samples for `room_readings`, one status per send for `device_status`.
+/// Everything QuestDB gets: samples for `room_readings`, statuses for `device_status`. `dev` and
+/// `fw` are symbol ids: the device ID and firmware version strings, interned by the gateway.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Rec {
-    Reading(Sample),
-    Status(Status),
+    Reading { dev: u16, s: Sample },
+    Status { dev: u16, fw: u16, s: Status },
+}
+
+/// A node's ID: its MAC's last three bytes in lowercase hex.
+pub fn device_id(mac: &[u8; 6]) -> [u8; 6] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = [0; 6];
+    for (i, b) in mac[3..].iter().enumerate() {
+        id[2 * i] = HEX[(b >> 4) as usize];
+        id[2 * i + 1] = HEX[(b & 0xF) as usize];
+    }
+    id
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -272,8 +280,7 @@ pub struct Status {
     pub battery_pct: f32,
     pub charge_rate: f32,
     pub rssi_dbm: i32,
-    pub wifi_ms: u32,
-    pub cached_connect: u8,
+    pub channel: u8,
     pub rtc_drift_ppm: i32,
     pub buffered: u32,
     pub dropped_samples: u32,
@@ -287,7 +294,7 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     use qwp::{FLOAT, LONG, SYMBOL};
     let readings = || {
         recs.iter().filter_map(|r| match r {
-            Rec::Reading(s) => Some(s),
+            Rec::Reading { dev, s } => Some((*dev as u64, s)),
             _ => None,
         })
     };
@@ -303,16 +310,16 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
                 ("flags", LONG),
             ],
         )?;
-        e.symbols(readings().map(|_| SYM_DEVICE))?;
-        e.f32s(readings().map(|s| s.temp_c()))?;
-        e.f32s(readings().map(|s| s.rh_pct()))?;
-        e.i64s(readings().map(|s| s.flags as i64))?;
-        e.timestamps(readings().map(|s| s.ts_s as i64 * 1_000_000))?;
+        e.symbols(readings().map(|(d, _)| d))?;
+        e.f32s(readings().map(|(_, s)| s.temp_c()))?;
+        e.f32s(readings().map(|(_, s)| s.rh_pct()))?;
+        e.i64s(readings().map(|(_, s)| s.flags as i64))?;
+        e.timestamps(readings().map(|(_, s)| s.ts_s as i64 * 1_000_000))?;
     }
 
     let status = || {
         recs.iter().filter_map(|r| match r {
-            Rec::Status(s) => Some(s),
+            Rec::Status { dev, fw, s } => Some((*dev as u64, *fw as u64, s)),
             _ => None,
         })
     };
@@ -328,8 +335,7 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
                 ("battery_pct", FLOAT),
                 ("charge_rate", FLOAT),
                 ("rssi_dbm", LONG),
-                ("wifi_ms", LONG),
-                ("cached_connect", LONG),
+                ("channel", LONG),
                 ("rtc_drift_ppm", LONG),
                 ("buffered", LONG),
                 ("dropped_samples", LONG),
@@ -338,21 +344,20 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
                 ("battery_chip", LONG),
             ],
         )?;
-        e.symbols(status().map(|_| SYM_DEVICE))?;
-        e.symbols(status().map(|_| SYM_FW))?;
-        e.f32s(status().map(|s| s.battery_v))?;
-        e.f32s(status().map(|s| s.battery_pct))?;
-        e.f32s(status().map(|s| s.charge_rate))?;
-        e.i64s(status().map(|s| s.rssi_dbm as i64))?;
-        e.i64s(status().map(|s| s.wifi_ms as i64))?;
-        e.i64s(status().map(|s| s.cached_connect as i64))?;
-        e.i64s(status().map(|s| s.rtc_drift_ppm as i64))?;
-        e.i64s(status().map(|s| s.buffered as i64))?;
-        e.i64s(status().map(|s| s.dropped_samples as i64))?;
-        e.i64s(status().map(|s| s.boot_count as i64))?;
-        e.i64s(status().map(|s| s.reset_reason as i64))?;
-        e.i64s(status().map(|s| s.battery_chip as i64))?;
-        e.timestamps(status().map(|s| s.t_us))?;
+        e.symbols(status().map(|(d, _, _)| d))?;
+        e.symbols(status().map(|(_, f, _)| f))?;
+        e.f32s(status().map(|(_, _, s)| s.battery_v))?;
+        e.f32s(status().map(|(_, _, s)| s.battery_pct))?;
+        e.f32s(status().map(|(_, _, s)| s.charge_rate))?;
+        e.i64s(status().map(|(_, _, s)| s.rssi_dbm as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.channel as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.rtc_drift_ppm as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.buffered as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.dropped_samples as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.boot_count as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.reset_reason as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.battery_chip as i64))?;
+        e.timestamps(status().map(|(_, _, s)| s.t_us))?;
     }
     Ok(())
 }
@@ -499,16 +504,32 @@ mod tests {
     #[test]
     fn encodes_both_tables() {
         let mut buf = [0u8; 512];
-        let mut e = qwp::Encoder::with_symbols(&mut buf, 0, &["a1b2c3", "0.2.0"]).unwrap();
+        let mut e =
+            qwp::Encoder::with_symbols(&mut buf, 0, &["a1b2c3", "0.3.0", "d4e5f6"]).unwrap();
         let s = Sample::new(1_800_000_000, 21.0, 40.0, 0);
         let st = Status {
             t_us: 1_800_000_000_000_000,
+            channel: 6,
             ..Default::default()
         };
-        encode(&mut e, &[Rec::Status(st), Rec::Reading(s), Rec::Reading(s)]).unwrap();
+        encode(
+            &mut e,
+            &[
+                Rec::Status { dev: 0, fw: 1, s: st },
+                Rec::Reading { dev: 0, s },
+                Rec::Reading { dev: 2, s },
+            ],
+        )
+        .unwrap();
         let len = e.finish();
         assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 2);
         let has = |n: &[u8]| buf[..len].windows(n.len()).any(|w| w == n);
         assert!(has(b"room_readings") && has(b"device_status") && has(b"fw_version"));
+        assert!(has(b"channel") && !has(b"wifi_ms") && !has(b"cached_connect"));
+    }
+
+    #[test]
+    fn device_id_hex() {
+        assert_eq!(&device_id(&[0, 0, 0, 0x61, 0x03, 0x38]), b"610338");
     }
 }
