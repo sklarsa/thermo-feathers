@@ -37,6 +37,16 @@ cargo run --release --bin node   # espflash flashes with partitions.csv and open
 A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off):
 tap RESET, then run the command.
 
+The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's
+the only device on WiFi, so it's the only build that needs credentials:
+
+```sh
+WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --release --bin gateway
+```
+
+It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address
+in your router so it stays put.
+
 ## Host tests
 
 The logic in `src/lib.rs` and `src/proto.rs` runs on the host against a checkout of qwp-embedded next to this repo:
