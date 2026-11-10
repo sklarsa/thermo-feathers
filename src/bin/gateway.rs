@@ -158,7 +158,6 @@ async fn main(spawner: Spawner) -> ! {
 
 /// Answers every node: Hello to Discover, Reply to Data once its records are in the ring.
 async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
-    let mut nodes = Nodes::new();
     let fw_unknown = SYMBOLS.intern("?").unwrap();
     let mut buf = [0u8; FRAME_MAX];
     loop {
@@ -180,10 +179,6 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                 samples,
             }) => {
                 let id = device_id(&src);
-                let Some(node) = nodes.slot(src) else {
-                    warn!("node table full: {} ignored", id_str(&id));
-                    continue;
-                };
                 let fw_len = status.fw.iter().position(|&b| b == 0).unwrap_or(12);
                 let fw = core::str::from_utf8(&status.fw[..fw_len]).unwrap_or("?");
                 let Some(dev) = SYMBOLS.intern(id_str(&id)) else {
@@ -195,7 +190,6 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     warn!("symbol table full: {} fw {fw} logged as ?", id_str(&id));
                     fw_unknown
                 });
-                (node.dev, node.fw) = (dev as u16, fw as u16);
                 // The node's time at wake: the same in every frame and retry of a wake, so
                 // QuestDB's dedup keeps one row. A node without time yet gets none.
                 let t_us = status.t_us;
@@ -219,8 +213,8 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                 let stored = ring.lock(|q| {
                     store_frame(
                         &mut q.borrow_mut(),
-                        node.dev,
-                        node.fw,
+                        dev as u16,
+                        fw as u16,
                         &samples[..n as usize],
                         status,
                     )
@@ -243,18 +237,24 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             }
             _ => continue, // someone else's ESP-NOW, or ours from a newer version
         };
-        if !esp.peer_exists(&src) {
-            let _ = esp.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Station,
-                peer_address: src,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
+        // A peer only for the reply: ESP-NOW's peer table holds about 20, and boards come and go
+        let peer = PeerInfo {
+            interface: EspNowWifiInterface::Station,
+            peer_address: src,
+            lmk: None,
+            channel: None,
+            encrypt: false,
+        };
+        if !esp.peer_exists(&src)
+            && let Err(e) = esp.add_peer(peer)
+        {
+            warn!("peer {}: {e:?}", id_str(&device_id(&src)));
+            continue;
         }
         if let Err(e) = esp.send_async(&src, &buf[..len]).await {
             warn!("reply to {}: {e:?}", id_str(&device_id(&src)));
         }
+        let _ = esp.remove_peer(&src);
     }
 }
 

@@ -34,7 +34,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 const FW: &str = env!("CARGO_PKG_VERSION");
 
-const WAKE_S: u32 = 60; // until the gateway says otherwise
+const WAKE_S: u16 = 60; // until the gateway says otherwise
+const WAKE_MIN_S: u16 = 10; // what a reply's wake interval is clamped to
+const WAKE_MAX_S: u16 = 3600;
 const CRITICAL_WAKE_S: u32 = 600;
 const LOW_PCT: f32 = 10.0; // the interval doubles below this
 const CRITICAL_V: f32 = 3.5; // no radio below this: its current spikes can brown the board out
@@ -62,7 +64,7 @@ struct State {
     gw_mac: [u8; 6],
     gw_channel: u8,
     nonce: u16,
-    /// From the gateway's last reply; 0 means WAKE_S.
+    /// From the gateway's last reply; WAKE_S until then.
     wake_s: u16,
     sweep_failures: u32,
     wakes_to_sweep: u32,
@@ -117,6 +119,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         st.battery_v = f32::NAN;
         st.battery_pct = f32::NAN;
         st.charge_rate = f32::NAN;
+        st.wake_s = WAKE_S;
         info!("cold boot: {reset:?}");
     }
     st.ring.fix();
@@ -182,11 +185,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     }
 
     // Sleep to a fixed cadence so wake length doesn't drift the samples.
-    let base = if st.wake_s == 0 {
-        WAKE_S
-    } else {
-        st.wake_s as u32
-    };
+    let base = st.wake_s as u32;
     let wake_s = if critical {
         CRITICAL_WAKE_S
     } else if st.battery_pct < LOW_PCT {
@@ -222,7 +221,7 @@ async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64, woke
     }
     if st.wakes_to_sweep > 0 {
         st.wakes_to_sweep -= 1;
-        warn!("no gateway; next sweep in {} wakes", st.wakes_to_sweep);
+        warn!("no gateway; next sweep in {} wakes", st.wakes_to_sweep + 1);
         return;
     }
     if sweep(esp, st).await && exchange(esp, st, rtc_us, woke_us).await {
@@ -231,15 +230,10 @@ async fn radio(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64, woke
         return;
     }
     st.sweep_failures += 1;
-    let wake_s = if st.wake_s == 0 {
-        WAKE_S
-    } else {
-        st.wake_s as u32
-    };
-    st.wakes_to_sweep = wakes_to_next_send(1, st.sweep_failures, wake_s);
+    st.wakes_to_sweep = sweep_skips(st.sweep_failures, st.wake_s as u32);
     warn!(
         "no gateway on any channel; next sweep in {} wakes",
-        st.wakes_to_sweep
+        st.wakes_to_sweep + 1
     );
 }
 
@@ -267,6 +261,10 @@ async fn exchange(
     }
     let t0 = Instant::now();
     let mut answered = false;
+    // One status time per wake, fixed once the clock is set: every frame and retry of this wake is
+    // the same device_status row, which QuestDB's (ts, device) dedup collapses to the last. Not
+    // recomputed after a reply re-syncs the clock, which would move it.
+    let mut wake_t_us = (st.clock.synced != 0).then(|| st.clock.epoch_us(woke_us));
     let mut buf = [0u8; FRAME_MAX];
     loop {
         let n = proto::sendable_prefix(&st.ring, MAX_SAMPLES);
@@ -278,13 +276,7 @@ async fn exchange(
         let mut fw = [0u8; 12];
         fw[..FW.len().min(12)].copy_from_slice(&FW.as_bytes()[..FW.len().min(12)]);
         let status = NodeStatus {
-            // One time per wake: every frame and retry of this wake is the same device_status
-            // row, which QuestDB's (ts, device) dedup collapses to the last.
-            t_us: if st.clock.synced == 0 {
-                0
-            } else {
-                st.clock.epoch_us(woke_us)
-            },
+            t_us: wake_t_us.unwrap_or(0),
             battery_v: st.battery_v,
             battery_pct: st.battery_pct,
             charge_rate: st.charge_rate,
@@ -335,16 +327,24 @@ async fn exchange(
             return answered;
         };
         answered = true;
-        proto::apply_reply(
+        if let Some(Err(step)) = proto::apply_reply(
             &mut st.clock,
             &mut st.ring,
             st.nonce,
             n as u8,
             &rep,
             rtc_us(),
-        );
+        ) {
+            warn!(
+                "gateway time {} s from ours, refused; RESET resets the clock",
+                step / 1_000_000
+            );
+        }
+        if wake_t_us.is_none() && st.clock.synced != 0 {
+            wake_t_us = Some(st.clock.epoch_us(woke_us));
+        }
         if rep.wake_s != 0 {
-            st.wake_s = rep.wake_s;
+            st.wake_s = rep.wake_s.clamp(WAKE_MIN_S, WAKE_MAX_S);
         }
         info!(
             "gateway stored {}/{n}, ring {}",

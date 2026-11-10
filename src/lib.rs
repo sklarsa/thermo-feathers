@@ -183,6 +183,10 @@ pub struct Clock {
     pub sync_epoch_us: i64,
     /// How fast the RTC runs against true time: true elapsed = rtc elapsed × (1 + ppm / 1e6).
     pub ppm: f32,
+    /// Where the rate is measured from. Syncs come every wake, too close together for a rate, so
+    /// this point stays put until one lands MIN_RATE_SPAN_US later.
+    pub rate_rtc_us: i64,
+    pub rate_epoch_us: i64,
 }
 
 const EPOCH_MIN_S: u32 = 1_000_000_000; // 2001
@@ -205,6 +209,8 @@ impl Clock {
                 sync_rtc_us: rtc_us,
                 sync_epoch_us: epoch_us,
                 ppm: 0.0,
+                rate_rtc_us: rtc_us,
+                rate_epoch_us: epoch_us,
             };
             return Ok(0);
         }
@@ -212,10 +218,12 @@ impl Clock {
         if step.abs() > DAY_US {
             return Err(step);
         }
-        let rtc_span = rtc_us - self.sync_rtc_us;
+        let rtc_span = rtc_us - self.rate_rtc_us;
         if rtc_span >= MIN_RATE_SPAN_US {
-            let true_span = epoch_us - self.sync_epoch_us;
+            let true_span = epoch_us - self.rate_epoch_us;
             self.ppm = ((true_span - rtc_span) as f64 * 1e6 / rtc_span as f64) as f32;
+            self.rate_rtc_us = rtc_us;
+            self.rate_epoch_us = epoch_us;
         }
         self.sync_rtc_us = rtc_us;
         self.sync_epoch_us = epoch_us;
@@ -254,6 +262,12 @@ impl Clock {
 pub fn wakes_to_next_send(send_every: u32, failures: u32, wake_s: u32) -> u32 {
     let cap = (3600 / wake_s.max(1)).max(1);
     (send_every << failures.min(16)).min(cap.max(send_every))
+}
+
+/// Wakes to skip before the next channel sweep after `failures` failed sweeps in a row: sweeps
+/// come 1, 2, 4… wakes apart, at most an hour apart.
+pub fn sweep_skips(failures: u32, wake_s: u32) -> u32 {
+    wakes_to_next_send(1, failures.saturating_sub(1), wake_s) - 1
 }
 
 /// Everything QuestDB gets: samples for `room_readings`, statuses for `device_status`. `dev` and
@@ -387,58 +401,6 @@ pub fn store_frame(
     n as u8
 }
 
-/// Nodes the gateway has heard from. More than a house needs; past that, new ones are refused.
-pub const MAX_NODES: usize = 8;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Node {
-    pub mac: [u8; 6],
-    /// Symbol ids of its device ID and firmware version.
-    pub dev: u16,
-    pub fw: u16,
-}
-
-pub struct Nodes {
-    n: usize,
-    all: [Node; MAX_NODES],
-}
-
-impl Nodes {
-    pub const fn new() -> Self {
-        Self {
-            n: 0,
-            all: [Node {
-                mac: [0; 6],
-                dev: 0,
-                fw: 0,
-            }; MAX_NODES],
-        }
-    }
-
-    /// The node with this MAC, added if new. `None` when it's new and the table is full.
-    pub fn slot(&mut self, mac: [u8; 6]) -> Option<&mut Node> {
-        let i = match self.all[..self.n].iter().position(|x| x.mac == mac) {
-            Some(i) => i,
-            None if self.n < MAX_NODES => {
-                self.all[self.n] = Node {
-                    mac,
-                    ..Default::default()
-                };
-                self.n += 1;
-                self.n - 1
-            }
-            None => return None,
-        };
-        Some(&mut self.all[i])
-    }
-}
-
-impl Default for Nodes {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +507,24 @@ mod tests {
     }
 
     #[test]
+    fn clock_learns_rate_from_frequent_syncs() {
+        // a gateway reply every wake: 60 true seconds read as 59.4 RTC seconds
+        let mut c = Clock::default();
+        for i in 0..12 {
+            c.sync(100_000_000 + i * 59_400_000, E0 + i * 60_000_000)
+                .unwrap();
+        }
+        assert!((c.ppm - 10101.01).abs() < 1.0, "{}", c.ppm);
+    }
+
+    #[test]
+    fn sweep_backoff_is_1_2_4_wakes_apart() {
+        let skips: Vec<u32> = (1..=8).map(|f| sweep_skips(f, 60)).collect();
+        assert_eq!(skips, [0, 1, 3, 7, 15, 31, 59, 59]); // an hour of wakes at most
+        assert_eq!(sweep_skips(1, 3600), 0);
+    }
+
+    #[test]
     fn clock_rejects_wild_sntp() {
         let mut c = Clock::default();
         c.sync(0, E0).unwrap();
@@ -636,7 +616,7 @@ mod tests {
             r.push(Sample::new(1_700_000_000 + i, 20.0, 40.0, 0));
         }
         let rep = reply(7, 3, 1_700_000_060_000_000);
-        assert!(proto::apply_reply(&mut c, &mut r, 7, 5, &rep, 60_000_000));
+        assert!(proto::apply_reply(&mut c, &mut r, 7, 5, &rep, 60_000_000).is_some());
         assert_eq!(r.len(), 2);
     }
 
@@ -646,8 +626,20 @@ mod tests {
         r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
         let before = c;
         let rep = reply(6, 1, 1_800_000_000_000_000);
-        assert!(!proto::apply_reply(&mut c, &mut r, 7, 1, &rep, 1));
+        assert!(proto::apply_reply(&mut c, &mut r, 7, 1, &rep, 1).is_none());
         assert_eq!((r.len(), c), (1, before));
+    }
+
+    #[test]
+    fn reply_with_wild_time_reports_it_and_still_acks() {
+        let (mut c, mut r) = (synced_clock(), ring());
+        r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
+        let rep = reply(1, 1, 1_700_000_000_000_000 + 3 * DAY_US);
+        assert!(matches!(
+            proto::apply_reply(&mut c, &mut r, 1, 1, &rep, 60_000_000),
+            Some(Err(_))
+        ));
+        assert_eq!(r.len(), 0);
     }
 
     #[test]
@@ -683,16 +675,6 @@ mod tests {
         assert_eq!(r.get(1).ts_s, 1_700_000_142);
     }
 
-    #[test]
-    fn nodes_full() {
-        let mut n = Nodes::new();
-        for i in 0..MAX_NODES as u8 {
-            assert!(n.slot([0, 0, 0, 0, 0, i]).is_some());
-        }
-        assert!(n.slot([0, 0, 0, 0, 1, 0]).is_none());
-        n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev = 5;
-        assert_eq!(n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev, 5);
-    }
     fn qring(cap: usize) -> qwp::Ring<Rec> {
         let buf = Box::leak(vec![core::mem::MaybeUninit::uninit(); cap].into_boxed_slice());
         qwp::Ring::new(buf)

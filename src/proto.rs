@@ -228,8 +228,9 @@ pub fn sendable_prefix(ring: &SampleRing, max: usize) -> usize {
 }
 
 /// Applies the gateway's reply to a `Data` frame that carried `sent` samples under `nonce`. A
-/// reply to some other frame changes nothing and returns `false`. Time from a gateway that has none
-/// yet (0) is ignored, but its ack still counts.
+/// reply to some other frame changes nothing and returns `None`. Otherwise the ack always counts,
+/// and the result is the clock sync's: `Err(step)` when the gateway's time was more than a day off
+/// and was refused. Time from a gateway that has none yet (0) is skipped, as `Ok(0)`.
 pub fn apply_reply(
     clock: &mut Clock,
     ring: &mut SampleRing,
@@ -237,15 +238,20 @@ pub fn apply_reply(
     sent: u8,
     r: &Reply,
     rtc_us: i64,
-) -> bool {
+) -> Option<Result<i64, i64>> {
     if r.nonce != nonce {
-        return false;
+        return None;
     }
-    if r.epoch_us > 0 && clock.sync(rtc_us, r.epoch_us).is_ok() {
+    let sync = if r.epoch_us > 0 {
+        clock.sync(rtc_us, r.epoch_us)
+    } else {
+        Ok(0)
+    };
+    if sync.is_ok() && clock.synced != 0 {
         clock.freeze_unsynced(ring);
     }
     ring.pop(r.stored.min(sent) as usize);
-    true
+    Some(sync)
 }
 
 #[cfg(test)]
