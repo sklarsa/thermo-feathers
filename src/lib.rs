@@ -6,21 +6,22 @@ pub use qwp_embedded as qwp;
 /// Sample flags (SPEC.md, Buffering and batching).
 pub const SENSOR_FAIL: u8 = 1 << 0;
 pub const OUT_OF_RANGE: u8 = 1 << 1;
+pub const TIME_UNSYNCED: u8 = 1 << 2;
+pub const CHARGING: u8 = 1 << 3;
 
 /// SHT41 address and its high-precision, heater-off measure command.
 pub const SHT41: u8 = 0x44;
 pub const SHT41_MEASURE: u8 = 0xFD;
 
-/// Symbol dictionary ID of the device: the sender registers `[device]` on each connection.
-const SYM_DEVICE: u64 = 0;
+/// Battery gauges, probed in this order; `battery_chip` reports which answered.
+pub const MAX17048: u8 = 0x36;
+pub const LC709203F: u8 = 0x0B;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Reading {
-    pub t_us: i64,
-    pub temp_c: f32,
-    pub rh_pct: f32,
-    pub flags: u8,
-}
+/// Symbol dictionary: the sender registers `[device, fw_version]` on each connection.
+const SYM_DEVICE: u64 = 0;
+const SYM_FW: u64 = 1;
+
+pub const RING_LEN: usize = 256; // ~4 h at 60 s
 
 /// Sensirion CRC-8: polynomial 0x31, init 0xFF.
 fn crc8(data: &[u8]) -> u8 {
@@ -38,7 +39,7 @@ fn crc8(data: &[u8]) -> u8 {
 }
 
 /// Turns the SHT41's 6-byte answer into (°C, %RH, flags). A bad CRC is a failed read; values
-/// outside -20..60 °C or 0..100 %RH are out of range. Either way the values are NaN.
+/// outside -20..60 °C are out of range, humidity is clamped to 0..100. Bad values are NaN.
 pub fn sht41_parse(b: &[u8; 6]) -> (f32, f32, u8) {
     if crc8(&b[0..2]) != b[2] || crc8(&b[3..5]) != b[5] {
         return (f32::NAN, f32::NAN, SENSOR_FAIL);
@@ -52,24 +53,308 @@ pub fn sht41_parse(b: &[u8; 6]) -> (f32, f32, u8) {
     (t, rh, 0)
 }
 
-/// `room_readings` rows. Column types match the table SPEC.md creates up front.
-pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Reading]) -> Result<(), qwp::Full> {
+/// MAX17048 registers to (volts, %, %/hour).
+pub fn max17048(vcell: u16, soc: u16, crate_: u16) -> (f32, f32, f32) {
+    (
+        vcell as f32 * 78.125e-6,
+        soc as f32 / 256.0,
+        crate_ as i16 as f32 * 0.208,
+    )
+}
+
+/// One sample as it sits in RTC memory through deep sleep: 12 bytes. Every bit pattern is valid,
+/// so a half-written slot after a reset is garbage, never undefined behaviour.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Sample {
+    /// Epoch seconds, or RTC seconds while `flags` has TIME_UNSYNCED.
+    pub ts_s: u32,
+    pub temp_cc: i16,
+    pub rh_cp: u16,
+    pub flags: u8,
+    _pad: [u8; 3],
+}
+
+/// Half away from zero; `f32::round` needs std.
+fn round(x: f32) -> f32 {
+    x + if x < 0.0 { -0.5 } else { 0.5 }
+}
+
+const TEMP_NAN: i16 = i16::MIN;
+const RH_NAN: u16 = u16::MAX;
+
+impl Sample {
+    pub fn new(ts_s: u32, temp_c: f32, rh_pct: f32, flags: u8) -> Self {
+        Self {
+            ts_s,
+            temp_cc: if temp_c.is_nan() {
+                TEMP_NAN
+            } else {
+                round(temp_c * 100.0) as i16
+            },
+            rh_cp: if rh_pct.is_nan() {
+                RH_NAN
+            } else {
+                round(rh_pct * 100.0) as u16
+            },
+            flags,
+            _pad: [0; 3],
+        }
+    }
+
+    pub fn temp_c(&self) -> f32 {
+        if self.temp_cc == TEMP_NAN {
+            f32::NAN
+        } else {
+            self.temp_cc as f32 / 100.0
+        }
+    }
+
+    pub fn rh_pct(&self) -> f32 {
+        if self.rh_cp == RH_NAN {
+            f32::NAN
+        } else {
+            self.rh_cp as f32 / 100.0
+        }
+    }
+}
+
+/// Drop-oldest ring of samples in RTC memory. Indexes are plain integers so it survives a reboot
+/// as data; `fix` clamps them if the memory held garbage.
+#[repr(C)]
+pub struct SampleRing {
+    head: u16,
+    len: u16,
+    buf: [Sample; RING_LEN],
+}
+
+impl SampleRing {
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// Returns whether the oldest sample was dropped to make room.
+    pub fn push(&mut self, s: Sample) -> bool {
+        let full = self.len() == RING_LEN;
+        if full {
+            self.head = ((self.head as usize + 1) % RING_LEN) as u16;
+            self.len -= 1;
+        }
+        self.buf[(self.head as usize + self.len()) % RING_LEN] = s;
+        self.len += 1;
+        full
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> &mut Sample {
+        &mut self.buf[(self.head as usize + i) % RING_LEN]
+    }
+
+    pub fn get(&self, i: usize) -> Sample {
+        self.buf[(self.head as usize + i) % RING_LEN]
+    }
+
+    /// Removes the `n` oldest: the ones QuestDB acked.
+    pub fn pop(&mut self, n: usize) {
+        let n = n.min(self.len());
+        self.head = ((self.head as usize + n) % RING_LEN) as u16;
+        self.len -= n as u16;
+    }
+
+    pub fn fix(&mut self) {
+        if self.head as usize >= RING_LEN || self.len() > RING_LEN {
+            self.clear();
+        }
+    }
+}
+
+/// RTC-to-epoch conversion, corrected for the RTC's measured rate (SPEC.md, Time sync).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Clock {
+    pub synced: u8,
+    pub sync_rtc_us: i64,
+    pub sync_epoch_us: i64,
+    /// How fast the RTC runs against true time: true elapsed = rtc elapsed × (1 + ppm / 1e6).
+    pub ppm: f32,
+}
+
+const EPOCH_MIN_S: u32 = 1_000_000_000; // 2001
+const DAY_US: i64 = 86_400_000_000;
+/// Shorter gaps than this make a noisy rate estimate; keep the old one.
+const MIN_RATE_SPAN_US: i64 = 300_000_000;
+
+impl Clock {
+    pub fn epoch_us(&self, rtc_us: i64) -> i64 {
+        let dt = rtc_us - self.sync_rtc_us;
+        self.sync_epoch_us + dt + (dt as f64 * self.ppm as f64 / 1e6) as i64
+    }
+
+    /// Takes an SNTP result: `epoch_us` was true at `rtc_us`. Rejects one more than a day from the
+    /// estimate once synced. Returns the step from the estimate, in µs.
+    pub fn sync(&mut self, rtc_us: i64, epoch_us: i64) -> Result<i64, i64> {
+        if self.synced == 0 {
+            *self = Self {
+                synced: 1,
+                sync_rtc_us: rtc_us,
+                sync_epoch_us: epoch_us,
+                ppm: 0.0,
+            };
+            return Ok(0);
+        }
+        let step = epoch_us - self.epoch_us(rtc_us);
+        if step.abs() > DAY_US {
+            return Err(step);
+        }
+        let rtc_span = rtc_us - self.sync_rtc_us;
+        if rtc_span >= MIN_RATE_SPAN_US {
+            let true_span = epoch_us - self.sync_epoch_us;
+            self.ppm = ((true_span - rtc_span) as f64 * 1e6 / rtc_span as f64) as f32;
+        }
+        self.sync_rtc_us = rtc_us;
+        self.sync_epoch_us = epoch_us;
+        Ok(step)
+    }
+
+    /// Converts samples taken before the first sync, once: their `ts_s` was RTC seconds. They keep
+    /// TIME_UNSYNCED, since their time is an estimate; an epoch-sized `ts_s` marks them converted
+    /// (RTC seconds would take 30 years to get there).
+    pub fn freeze_unsynced(&self, ring: &mut SampleRing) {
+        for i in 0..ring.len() {
+            let s = ring.get_mut(i);
+            if s.flags & TIME_UNSYNCED != 0 && s.ts_s < EPOCH_MIN_S {
+                s.ts_s = (self.epoch_us(s.ts_s as i64 * 1_000_000) / 1_000_000) as u32;
+            }
+        }
+    }
+
+    /// Whether a sample's timestamp is epoch time yet, so it can be sent.
+    pub fn sendable(s: &Sample) -> bool {
+        s.ts_s >= EPOCH_MIN_S
+    }
+
+    /// The timestamp a new sample freezes with, and its TIME_UNSYNCED flag.
+    pub fn stamp(&self, rtc_us: i64) -> (u32, u8) {
+        if self.synced == 0 {
+            ((rtc_us / 1_000_000) as u32, TIME_UNSYNCED)
+        } else {
+            ((self.epoch_us(rtc_us) / 1_000_000) as u32, 0)
+        }
+    }
+}
+
+/// Wakes until the next send after `failures` failed sends in a row: 1×, 2×, 4×… the send
+/// interval, capped at an hour of wakes.
+pub fn wakes_to_next_send(send_every: u32, failures: u32, wake_s: u32) -> u32 {
+    let cap = (3600 / wake_s.max(1)).max(1);
+    (send_every << failures.min(16)).min(cap.max(send_every))
+}
+
+/// Everything QuestDB gets: samples for `room_readings`, one status per send for `device_status`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Rec {
+    Reading(Sample),
+    Status(Status),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Status {
+    pub t_us: i64,
+    pub battery_v: f32,
+    pub battery_pct: f32,
+    pub charge_rate: f32,
+    pub rssi_dbm: i32,
+    pub wifi_ms: u32,
+    pub cached_connect: u8,
+    pub rtc_drift_ppm: i32,
+    pub buffered: u32,
+    pub dropped_samples: u32,
+    pub boot_count: u32,
+    pub reset_reason: u32,
+    pub battery_chip: u8,
+}
+
+/// Both tables. Column types match the tables SPEC.md creates up front.
+pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     use qwp::{FLOAT, LONG, SYMBOL};
-    e.table(
-        "room_readings",
-        recs.len(),
-        &[
-            ("device", SYMBOL),
-            ("temp_c", FLOAT),
-            ("rh_pct", FLOAT),
-            ("flags", LONG),
-        ],
-    )?;
-    e.symbols(recs.iter().map(|_| SYM_DEVICE))?;
-    e.f32s(recs.iter().map(|r| r.temp_c))?;
-    e.f32s(recs.iter().map(|r| r.rh_pct))?;
-    e.i64s(recs.iter().map(|r| r.flags as i64))?;
-    e.timestamps(recs.iter().map(|r| r.t_us))
+    let readings = || {
+        recs.iter().filter_map(|r| match r {
+            Rec::Reading(s) => Some(s),
+            _ => None,
+        })
+    };
+    let n = readings().count();
+    if n > 0 {
+        e.table(
+            "room_readings",
+            n,
+            &[
+                ("device", SYMBOL),
+                ("temp_c", FLOAT),
+                ("rh_pct", FLOAT),
+                ("flags", LONG),
+            ],
+        )?;
+        e.symbols(readings().map(|_| SYM_DEVICE))?;
+        e.f32s(readings().map(|s| s.temp_c()))?;
+        e.f32s(readings().map(|s| s.rh_pct()))?;
+        e.i64s(readings().map(|s| s.flags as i64))?;
+        e.timestamps(readings().map(|s| s.ts_s as i64 * 1_000_000))?;
+    }
+
+    let status = || {
+        recs.iter().filter_map(|r| match r {
+            Rec::Status(s) => Some(s),
+            _ => None,
+        })
+    };
+    let n = status().count();
+    if n > 0 {
+        e.table(
+            "device_status",
+            n,
+            &[
+                ("device", SYMBOL),
+                ("fw_version", SYMBOL),
+                ("battery_v", FLOAT),
+                ("battery_pct", FLOAT),
+                ("charge_rate", FLOAT),
+                ("rssi_dbm", LONG),
+                ("wifi_ms", LONG),
+                ("cached_connect", LONG),
+                ("rtc_drift_ppm", LONG),
+                ("buffered", LONG),
+                ("dropped_samples", LONG),
+                ("boot_count", LONG),
+                ("reset_reason", LONG),
+                ("battery_chip", LONG),
+            ],
+        )?;
+        e.symbols(status().map(|_| SYM_DEVICE))?;
+        e.symbols(status().map(|_| SYM_FW))?;
+        e.f32s(status().map(|s| s.battery_v))?;
+        e.f32s(status().map(|s| s.battery_pct))?;
+        e.f32s(status().map(|s| s.charge_rate))?;
+        e.i64s(status().map(|s| s.rssi_dbm as i64))?;
+        e.i64s(status().map(|s| s.wifi_ms as i64))?;
+        e.i64s(status().map(|s| s.cached_connect as i64))?;
+        e.i64s(status().map(|s| s.rtc_drift_ppm as i64))?;
+        e.i64s(status().map(|s| s.buffered as i64))?;
+        e.i64s(status().map(|s| s.dropped_samples as i64))?;
+        e.i64s(status().map(|s| s.boot_count as i64))?;
+        e.i64s(status().map(|s| s.reset_reason as i64))?;
+        e.i64s(status().map(|s| s.battery_chip as i64))?;
+        e.timestamps(status().map(|s| s.t_us))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -114,29 +399,116 @@ mod tests {
     }
 
     #[test]
-    fn encodes_one_table() {
-        let mut buf = [0u8; 256];
-        let mut e = qwp::Encoder::with_symbols(&mut buf, 0, &["a1b2c3"]).unwrap();
-        let r = Reading {
-            t_us: 1_700_000_000_000_000,
-            temp_c: 21.0,
-            rh_pct: 40.0,
-            flags: 0,
+    fn gauge_units() {
+        let (v, pct, rate) = max17048(0xC800, 0x5080, (-5i16) as u16);
+        assert!((v - 3.99999).abs() < 1e-3, "{v}"); // 51200 × 78.125 µV = 4.0 V
+        assert_eq!(pct, 80.5);
+        assert!((rate + 1.04).abs() < 1e-4, "{rate}");
+    }
+
+    #[test]
+    fn sample_packs_in_12_bytes() {
+        assert_eq!(core::mem::size_of::<Sample>(), 12);
+        let s = Sample::new(5, 21.234, 40.567, 0);
+        assert_eq!((s.temp_c(), s.rh_pct()), (21.23, 40.57));
+        let s = Sample::new(5, f32::NAN, f32::NAN, SENSOR_FAIL);
+        assert!(s.temp_c().is_nan() && s.rh_pct().is_nan());
+        assert_eq!(Sample::new(5, -12.5, 0.0, 0).temp_c(), -12.5);
+    }
+
+    fn ring() -> Box<SampleRing> {
+        let mut r = Box::new(SampleRing {
+            head: 7,
+            len: 9999, // garbage, as after a power-on
+            buf: [Sample::default(); RING_LEN],
+        });
+        r.fix();
+        r
+    }
+
+    #[test]
+    fn ring_drops_oldest_and_wraps() {
+        let mut r = ring();
+        assert!(r.is_empty());
+        for i in 0..RING_LEN as u32 {
+            assert!(!r.push(Sample::new(i, 0.0, 0.0, 0)));
+        }
+        assert!(r.push(Sample::new(1000, 0.0, 0.0, 0)));
+        assert_eq!(r.len(), RING_LEN);
+        assert_eq!(r.get(0).ts_s, 1); // 0 was dropped
+        assert_eq!(r.get(RING_LEN - 1).ts_s, 1000);
+        r.pop(10);
+        assert_eq!((r.len(), r.get(0).ts_s), (RING_LEN - 10, 11));
+        r.pop(1000);
+        assert!(r.is_empty());
+        r.push(Sample::new(42, 0.0, 0.0, 0));
+        assert_eq!(r.get(0).ts_s, 42);
+    }
+
+    const E0: i64 = 1_800_000_000_000_000;
+
+    #[test]
+    fn clock_measures_and_corrects_rate() {
+        let mut c = Clock::default();
+        assert_eq!(c.stamp(90_000_000), (90, TIME_UNSYNCED));
+        c.sync(100_000_000, E0).unwrap();
+        // the RTC runs 1% slow: 600 s of true time reads as 594 s
+        let rtc = 100_000_000 + 594_000_000;
+        let step = c.sync(rtc, E0 + 600_000_000).unwrap();
+        assert_eq!(step, 6_000_000);
+        assert!((c.ppm - 10101.01).abs() < 1.0, "{}", c.ppm);
+        // the next 594 RTC seconds are now predicted as 600 true seconds
+        let est = c.epoch_us(rtc + 594_000_000);
+        assert!((est - (E0 + 1_200_000_000)).abs() < 1000, "{}", est - E0);
+    }
+
+    #[test]
+    fn clock_rejects_wild_sntp() {
+        let mut c = Clock::default();
+        c.sync(0, E0).unwrap();
+        let before = c;
+        assert!(c.sync(600_000_000, E0 + 3 * DAY_US).is_err());
+        assert_eq!(c, before);
+    }
+
+    #[test]
+    fn unsynced_samples_freeze_once() {
+        let mut r = ring();
+        let mut c = Clock::default();
+        let (ts, f) = c.stamp(10_000_000);
+        r.push(Sample::new(ts, 20.0, 50.0, f));
+        c.sync(70_000_000, E0).unwrap();
+        c.freeze_unsynced(&mut r);
+        let s = r.get(0);
+        assert_eq!(s.ts_s as i64, (E0 - 60_000_000) / 1_000_000);
+        assert_eq!(s.flags, TIME_UNSYNCED);
+        assert!(Clock::sendable(&s));
+        c.freeze_unsynced(&mut r); // a second sync never moves it again
+        assert_eq!(r.get(0), s);
+    }
+
+    #[test]
+    fn backoff_doubles_to_an_hour() {
+        assert_eq!(wakes_to_next_send(10, 0, 60), 10);
+        assert_eq!(wakes_to_next_send(10, 1, 60), 20);
+        assert_eq!(wakes_to_next_send(10, 2, 60), 40);
+        assert_eq!(wakes_to_next_send(10, 3, 60), 60);
+        assert_eq!(wakes_to_next_send(10, 30, 60), 60);
+    }
+
+    #[test]
+    fn encodes_both_tables() {
+        let mut buf = [0u8; 512];
+        let mut e = qwp::Encoder::with_symbols(&mut buf, 0, &["a1b2c3", "0.2.0"]).unwrap();
+        let s = Sample::new(1_800_000_000, 21.0, 40.0, 0);
+        let st = Status {
+            t_us: 1_800_000_000_000_000,
+            ..Default::default()
         };
-        encode(
-            &mut e,
-            &[
-                r,
-                Reading {
-                    t_us: r.t_us + 60_000_000,
-                    ..r
-                },
-            ],
-        )
-        .unwrap();
+        encode(&mut e, &[Rec::Status(st), Rec::Reading(s), Rec::Reading(s)]).unwrap();
         let len = e.finish();
-        assert_eq!(&buf[..4], b"QWP1");
-        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 1); // one table
-        assert!(buf[..len].windows(13).any(|w| w == b"room_readings"));
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 2);
+        let has = |n: &[u8]| buf[..len].windows(n.len()).any(|w| w == n);
+        assert!(has(b"room_readings") && has(b"device_status") && has(b"fw_version"));
     }
 }
