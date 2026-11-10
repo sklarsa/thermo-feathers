@@ -31,7 +31,7 @@ static_cell            = "2.1.1"
 log                    = "0.4.27"
 sntpc                  = { version = "0.11", default-features = false }
 sntpc-net-embassy      = { version = "0.11", default-features = false }
-qwp-embedded           = { git = "https://github.com/sklarsa/qwp-embedded", rev = "2aaa4f4d6354e8cb569e317bbbfe9807cadc125c", features = ["sender"] }
+qwp-embedded           = { git = "https://github.com/sklarsa/qwp-embedded", rev = "fc0b56fcb99d5758962748232bf8d4a8426aa612", features = ["sender"] }
 
 [profile.dev]
 # The default debug profile is too slow and too big for resource-constrained devices.
