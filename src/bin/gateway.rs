@@ -158,9 +158,13 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
         let r = esp.receive_async().await;
         let src = r.info.src_address;
         let len = match proto::decode(r.data()) {
-            Some(Frame::Discover) => {
-                info!("discover from {}", id_str(&device_id(&src)));
-                proto::encode(&Frame::Hello, &mut buf)
+            // Not before joining WiFi: until then the radio is scanning, and a node would keep a
+            // channel the gateway is about to leave.
+            Some(Frame::Discover) if WIFI_CHANNEL.load(Relaxed) != 0 => {
+                // the channel this arrived on is the one the gateway is on now
+                let channel = r.info.rx_control.channel as u8;
+                info!("discover from {}, ch {channel}", id_str(&device_id(&src)));
+                proto::encode(&Frame::Hello { channel }, &mut buf)
             }
             Some(Frame::Data {
                 nonce,
@@ -190,43 +194,40 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                 };
                 let rssi = r.info.rx_control.rssi;
                 let channel = r.info.rx_control.channel as u8;
-                ring.lock(|q| {
-                    let mut q = q.borrow_mut();
-                    for s in &samples[..n as usize] {
-                        q.push(Rec::Reading {
-                            dev: node.dev,
-                            s: *s,
-                        });
-                    }
-                    if t_us > 0 {
-                        q.push(Rec::Status {
-                            dev: node.dev,
-                            fw: node.fw,
-                            s: Status {
-                                t_us,
-                                battery_v: status.battery_v,
-                                battery_pct: status.battery_pct,
-                                charge_rate: status.charge_rate,
-                                rssi_dbm: rssi,
-                                channel,
-                                rtc_drift_ppm: status.rtc_drift_ppm,
-                                buffered: status.buffered as u32,
-                                dropped_samples: status.dropped_samples,
-                                boot_count: status.boot_count,
-                                reset_reason: status.reset_reason as u32,
-                                battery_chip: status.battery_chip,
-                            },
-                        });
-                    }
+                let status = (t_us > 0).then_some(Status {
+                    t_us,
+                    battery_v: status.battery_v,
+                    battery_pct: status.battery_pct,
+                    charge_rate: status.charge_rate,
+                    rssi_dbm: rssi,
+                    channel,
+                    rtc_drift_ppm: status.rtc_drift_ppm,
+                    buffered: status.buffered as u32,
+                    dropped_samples: status.dropped_samples,
+                    boot_count: status.boot_count,
+                    reset_reason: status.reset_reason as u32,
+                    battery_chip: status.battery_chip,
                 });
+                let buffered = status.map_or(0, |s| s.buffered);
+                let stored = ring.lock(|q| {
+                    store_frame(
+                        &mut q.borrow_mut(),
+                        node.dev,
+                        node.fw,
+                        &samples[..n as usize],
+                        status,
+                    )
+                });
+                if stored < n {
+                    warn!("ring full: stored {stored}/{n} from {}", id_str(&id));
+                }
                 info!(
-                    "{}: {n} samples, buffered {}, rssi {rssi}, ch {channel}",
-                    id_str(&id),
-                    status.buffered
+                    "{}: {stored}/{n} samples, buffered {buffered}, rssi {rssi}, ch {channel}",
+                    id_str(&id)
                 );
                 let reply = Reply {
                     nonce,
-                    stored: n,
+                    stored,
                     epoch_us: if SYNCED.load(Relaxed) { now_us() } else { 0 },
                     wake_s: WAKE_S,
                     flags: 0,

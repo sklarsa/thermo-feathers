@@ -60,8 +60,11 @@ pub struct Reply {
 pub enum Frame {
     /// Node → broadcast: "where's the gateway?"
     Discover,
-    /// Gateway → node. The gateway's MAC is the frame's source address.
-    Hello,
+    /// Gateway → node: the gateway's own WiFi channel. Its MAC is the frame's source address. The
+    /// node keeps this channel, not the one it heard the Hello on: neighbouring channels overlap.
+    Hello {
+        channel: u8,
+    },
     Data {
         nonce: u16,
         status: NodeStatus,
@@ -115,13 +118,14 @@ pub fn encode(f: &Frame, out: &mut [u8; FRAME_MAX]) -> usize {
     let mut w = W { b: out, n: 0 };
     let kind = match f {
         Frame::Discover => DISCOVER,
-        Frame::Hello => HELLO,
+        Frame::Hello { .. } => HELLO,
         Frame::Data { .. } => DATA,
         Frame::Reply(_) => REPLY,
     };
     w.put(&[MAGIC, VERSION, kind]);
     match f {
-        Frame::Discover | Frame::Hello => {}
+        Frame::Discover => {}
+        Frame::Hello { channel } => w.put(&[*channel]),
         Frame::Data {
             nonce,
             status: s,
@@ -167,7 +171,9 @@ pub fn decode(b: &[u8]) -> Option<Frame> {
     let mut r = R { b: &b[HEADER..] };
     match b[2] {
         DISCOVER if b.len() == HEADER => Some(Frame::Discover),
-        HELLO if b.len() == HEADER => Some(Frame::Hello),
+        HELLO if b.len() == HEADER + 1 && (1..=13).contains(&b[HEADER]) => {
+            Some(Frame::Hello { channel: b[HEADER] })
+        }
         DATA if b.len() >= DATA_FIXED => {
             let nonce = r.u16();
             let status = NodeStatus {
@@ -277,7 +283,7 @@ mod tests {
         let mut b = [0; FRAME_MAX];
         for f in [
             Frame::Discover,
-            Frame::Hello,
+            Frame::Hello { channel: 6 },
             Frame::Reply(Reply {
                 nonce: 3,
                 stored: 16,
@@ -307,6 +313,10 @@ mod tests {
         assert_eq!(decode(&b[..len]), None); // other version
         assert_eq!(decode(&[]), None);
         assert_eq!(decode(&[0xAA; 40]), None); // someone else's ESP-NOW
+        let n = encode(&Frame::Hello { channel: 14 }, &mut b);
+        assert_eq!(decode(&b[..n]), None); // no such 2.4 GHz channel here
+        let n = encode(&Frame::Hello { channel: 0 }, &mut b);
+        assert_eq!(decode(&b[..n]), None);
         let mut d = [0; FRAME_MAX];
         let empty = Frame::Data {
             nonce: 0,

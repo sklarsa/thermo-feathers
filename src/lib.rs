@@ -364,6 +364,29 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     Ok(())
 }
 
+/// Puts a node frame's readings, then its status, into the gateway's ring, stopping at the first
+/// that doesn't fit. Returns how many readings went in: the only number the gateway may ack, since
+/// the node deletes what it's told was stored.
+pub fn store_frame(
+    q: &mut qwp::Ring<Rec>,
+    dev: u16,
+    fw: u16,
+    samples: &[Sample],
+    status: Option<Status>,
+) -> u8 {
+    let free = q.capacity() - q.len();
+    let n = samples.len().min(free);
+    for s in &samples[..n] {
+        q.push(Rec::Reading { dev, s: *s });
+    }
+    if let Some(s) = status
+        && free > n
+    {
+        q.push(Rec::Status { dev, fw, s });
+    }
+    n as u8
+}
+
 /// Nodes the gateway has heard from. More than a house needs; past that, new ones are refused.
 pub const MAX_NODES: usize = 8;
 
@@ -669,5 +692,30 @@ mod tests {
         assert!(n.slot([0, 0, 0, 0, 1, 0]).is_none());
         n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev = 5;
         assert_eq!(n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev, 5);
+    }
+    fn qring(cap: usize) -> qwp::Ring<Rec> {
+        let buf = Box::leak(vec![core::mem::MaybeUninit::uninit(); cap].into_boxed_slice());
+        qwp::Ring::new(buf)
+    }
+
+    #[test]
+    fn store_frame_acks_only_what_fits() {
+        let mut q = qring(3);
+        let s = [Sample::new(1_700_000_000, 20.0, 40.0, 0); 5];
+        let st = Status::default();
+        assert_eq!(store_frame(&mut q, 1, 2, &s, Some(st)), 3); // no room left for the status
+        assert_eq!(q.len(), 3);
+        assert_eq!(store_frame(&mut q, 1, 2, &s, Some(st)), 0);
+        q.pop(3);
+        assert_eq!(store_frame(&mut q, 1, 2, &s[..1], Some(st)), 1);
+        assert_eq!(q.len(), 2); // reading and status
+        assert_eq!(
+            q.get(1),
+            Some(Rec::Status {
+                dev: 1,
+                fw: 2,
+                s: st
+            })
+        );
     }
 }

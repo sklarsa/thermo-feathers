@@ -228,6 +228,7 @@ async fn exchange(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) -
     if esp.set_channel(st.gw_channel).is_err() {
         return false;
     }
+    while esp.receive().is_some() {}
     if !esp.peer_exists(&st.gw_mac) {
         let _ = esp.add_peer(PeerInfo {
             interface: EspNowWifiInterface::Station,
@@ -321,13 +322,18 @@ async fn exchange(esp: &mut EspNow, st: &mut State, rtc_us: &impl Fn() -> i64) -
             rep.stored.min(n as u8),
             st.ring.len()
         );
-        if proto::sendable_prefix(&st.ring, 1) == 0 || t0.elapsed() > RADIO_CAP {
+        // stored < n: the gateway is full; what's left waits for the next wake
+        if rep.stored < n as u8
+            || proto::sendable_prefix(&st.ring, 1) == 0
+            || t0.elapsed() > RADIO_CAP
+        {
             return true;
         }
     }
 }
 
-/// Broadcasts Discover on channels 1–13 and keeps the first gateway that says Hello.
+/// Broadcasts Discover on channels 1–13 and keeps the first gateway that says Hello, on the
+/// channel the Hello names: a gateway on 6 can be overheard on 4 or 5.
 async fn sweep(esp: &mut EspNow, st: &mut State) -> bool {
     let mut buf = [0u8; FRAME_MAX];
     let len = proto::encode(&Frame::Discover, &mut buf);
@@ -335,6 +341,7 @@ async fn sweep(esp: &mut EspNow, st: &mut State) -> bool {
         if esp.set_channel(ch).is_err() {
             continue;
         }
+        while esp.receive().is_some() {} // a late Hello from the last channel isn't an answer here
         if esp
             .send_async(&BROADCAST_ADDRESS, &buf[..len])
             .await
@@ -345,19 +352,19 @@ async fn sweep(esp: &mut EspNow, st: &mut State) -> bool {
         let hello = with_timeout(HELLO_WAIT, async {
             loop {
                 let r = esp.receive_async().await;
-                if proto::decode(r.data()) == Some(Frame::Hello) {
-                    return r.info.src_address;
+                if let Some(Frame::Hello { channel }) = proto::decode(r.data()) {
+                    return (r.info.src_address, channel);
                 }
             }
         })
         .await;
-        if let Ok(mac) = hello {
+        if let Ok((mac, channel)) = hello {
             if st.gw_channel != 0 && esp.peer_exists(&st.gw_mac) {
                 let _ = esp.remove_peer(&st.gw_mac);
             }
             st.gw_mac = mac;
-            st.gw_channel = ch;
-            info!("gateway found on channel {ch}");
+            st.gw_channel = channel;
+            info!("gateway found on channel {channel} (heard on {ch})");
             return true;
         }
     }
