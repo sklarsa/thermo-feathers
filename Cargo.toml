@@ -6,8 +6,8 @@ version      = "0.3.0"
 license      = "MIT"
 
 [[bin]]
-name = "thermo-feathers"
-path = "./src/bin/main.rs"
+name = "node"
+path = "./src/bin/node.rs"
 
 [dependencies]
 esp-hal                = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
@@ -16,7 +16,7 @@ esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
 esp-backtrace          = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
 esp-println            = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 esp-alloc              = { version = "0.11.0", features = ["esp32s3"] }
-esp-radio              = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi"] }
+esp-radio              = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi", "esp-now"] }
 embassy-executor       = { version = "0.10.0", features = ["log"] }
 embassy-net            = { version = "0.9.1", features = ["dhcpv4", "dns", "log", "medium-ethernet", "tcp", "udp"] }
 embassy-futures        = "0.1.2"

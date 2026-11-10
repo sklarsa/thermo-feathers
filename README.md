@@ -1,13 +1,16 @@
 # thermo-feathers
 
-`no_std` Rust firmware for battery-powered room temperature and humidity nodes: an Adafruit
-ESP32-S3 Feather with an SHT41 on STEMMA QT wakes every minute, buffers readings in RTC memory
-through deep sleep, and sends a batch to [QuestDB](https://questdb.com) over QWP every 10 minutes
-with [qwp-embedded](https://github.com/sklarsa/qwp-embedded). Every node runs the same image;
-credentials, identity and settings live outside it.
+`no_std` Rust firmware for battery-powered room temperature and humidity nodes and the gateway
+they report to. A node is an Adafruit ESP32-S3 Feather with an SHT41 on STEMMA QT: it wakes every
+minute, buffers readings in RTC memory through deep sleep, and sends them over ESP-NOW to a
+wall-powered gateway Feather, which forwards them to [QuestDB](https://questdb.com) over QWP with
+[qwp-embedded](https://github.com/sklarsa/qwp-embedded). Nodes never join WiFi. Every node runs the
+same image.
 
-[SPEC.md](SPEC.md) is the design. **Status: scaffold.** It builds and boots at 80 MHz; milestone 1
-(plugged-in SHT41 logger) is next.
+[SPEC.md](SPEC.md) is the original design; the
+[v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) replaces its WiFi parts.
+**Status:** v2 milestone 1 done (deep-sleep wakes proven: 841 in a row on 2026-11-10); the ESP-NOW
+link is built and waiting for its hardware test.
 
 ## Bill of materials
 
@@ -28,12 +31,15 @@ The enclosure isn't designed yet. Pins and power rules are in [SPEC.md](SPEC.md#
 Same toolchain as s3-sensors: `espup install --targets esp32s3`, source `~/export-esp.sh`, then
 
 ```sh
-cargo run --release   # espflash flashes with partitions.csv and opens the monitor
+cargo run --release --bin node   # espflash flashes with partitions.csv and opens the monitor
 ```
+
+A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off):
+tap RESET, then run the command.
 
 ## Host tests
 
-The logic in `src/lib.rs` runs on the host against a checkout of qwp-embedded next to this repo:
+The logic in `src/lib.rs` and `src/proto.rs` runs on the host against a checkout of qwp-embedded next to this repo:
 
 ```sh
 rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib

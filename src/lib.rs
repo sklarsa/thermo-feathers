@@ -569,7 +569,11 @@ mod tests {
         encode(
             &mut e,
             &[
-                Rec::Status { dev: 0, fw: 1, s: st },
+                Rec::Status {
+                    dev: 0,
+                    fw: 1,
+                    s: st,
+                },
                 Rec::Reading { dev: 0, s },
                 Rec::Reading { dev: 2, s },
             ],

@@ -52,6 +52,10 @@ pub struct Reply {
     pub flags: u8,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a frame is at most 250 B; boxing needs a heap"
+)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Frame {
     /// Node → broadcast: "where's the gateway?"
