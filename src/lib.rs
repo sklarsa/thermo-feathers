@@ -3,6 +3,8 @@
 
 pub use qwp_embedded as qwp;
 
+pub mod proto;
+
 /// Sample flags (SPEC.md, Buffering and batching).
 pub const SENSOR_FAIL: u8 = 1 << 0;
 pub const OUT_OF_RANGE: u8 = 1 << 1;
