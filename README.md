@@ -9,16 +9,19 @@ credentials, identity and settings live outside it.
 [SPEC.md](SPEC.md) is the design. **Status: scaffold.** It builds and boots at 80 MHz; milestone 1
 (plugged-in SHT41 logger) is next.
 
-## Hardware
+## Bill of materials
 
-| Part | Adafruit PID |
-|---|---|
-| ESP32-S3 Feather, 4 MB flash / 2 MB PSRAM | 5477 |
-| SHT41 | 5776 |
-| LiPo 3.7 V 1200 mAh | 258 |
-| STEMMA QT cable, 200–400 mm | 4401 / 5384 / 5385 |
+Per node. Everything is from Adafruit and plugs together, no soldering.
 
-No soldering. Pins and power rules are in [SPEC.md](SPEC.md#hardware).
+| Qty | Part | Adafruit PID | Notes |
+|---|---|---|---|
+| 1 | [ESP32-S3 Feather, 4 MB flash / 2 MB PSRAM](https://www.adafruit.com/product/5477) | 5477 | Has the MAX17048 battery gauge on board |
+| 1 | [SHT41 temperature and humidity sensor, STEMMA QT](https://www.adafruit.com/product/5776) | 5776 | |
+| 1 | STEMMA QT cable, 200–400 mm ([4401](https://www.adafruit.com/product/4401), [5384](https://www.adafruit.com/product/5384) or [5385](https://www.adafruit.com/product/5385)) | | Long enough to keep the sensor away from the board's heat |
+| 1 | [LiPo 3.7 V 1200 mAh](https://www.adafruit.com/product/258) | 258 | Battery operation, from milestone 2 |
+| 1 | USB-C cable and 5 V USB power supply | | Flashing, charging, and plugged-in running |
+
+The enclosure isn't designed yet. Pins and power rules are in [SPEC.md](SPEC.md#hardware).
 
 ## Build and flash
 
