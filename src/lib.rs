@@ -364,6 +364,58 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     Ok(())
 }
 
+/// Nodes the gateway has heard from. More than a house needs; past that, new ones are refused.
+pub const MAX_NODES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Node {
+    pub mac: [u8; 6],
+    /// Symbol ids of its device ID and firmware version.
+    pub dev: u16,
+    pub fw: u16,
+}
+
+pub struct Nodes {
+    n: usize,
+    all: [Node; MAX_NODES],
+}
+
+impl Nodes {
+    pub const fn new() -> Self {
+        Self {
+            n: 0,
+            all: [Node {
+                mac: [0; 6],
+                dev: 0,
+                fw: 0,
+            }; MAX_NODES],
+        }
+    }
+
+    /// The node with this MAC, added if new. `None` when it's new and the table is full.
+    pub fn slot(&mut self, mac: [u8; 6]) -> Option<&mut Node> {
+        let i = match self.all[..self.n].iter().position(|x| x.mac == mac) {
+            Some(i) => i,
+            None if self.n < MAX_NODES => {
+                self.all[self.n] = Node {
+                    mac,
+                    ..Default::default()
+                };
+                self.n += 1;
+                self.n - 1
+            }
+            None => return None,
+        };
+        Some(&mut self.all[i])
+    }
+}
+
+impl Default for Nodes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +585,85 @@ mod tests {
     #[test]
     fn device_id_hex() {
         assert_eq!(&device_id(&[0, 0, 0, 0x61, 0x03, 0x38]), b"610338");
+    }
+    fn synced_clock() -> Clock {
+        let mut c = Clock::default();
+        c.sync(0, 1_700_000_000_000_000).unwrap();
+        c
+    }
+
+    fn reply(nonce: u16, stored: u8, epoch_us: i64) -> proto::Reply {
+        proto::Reply {
+            nonce,
+            stored,
+            epoch_us,
+            wake_s: 60,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn reply_pops_what_was_stored() {
+        let (mut c, mut r) = (synced_clock(), ring());
+        for i in 0..5 {
+            r.push(Sample::new(1_700_000_000 + i, 20.0, 40.0, 0));
+        }
+        let rep = reply(7, 3, 1_700_000_060_000_000);
+        assert!(proto::apply_reply(&mut c, &mut r, 7, 5, &rep, 60_000_000));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn reply_wrong_nonce_ignored() {
+        let (mut c, mut r) = (synced_clock(), ring());
+        r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
+        let before = c;
+        let rep = reply(6, 1, 1_800_000_000_000_000);
+        assert!(!proto::apply_reply(&mut c, &mut r, 7, 1, &rep, 1));
+        assert_eq!((r.len(), c), (1, before));
+    }
+
+    #[test]
+    fn reply_stored_clamped() {
+        let (mut c, mut r) = (synced_clock(), ring());
+        for i in 0..4 {
+            r.push(Sample::new(1_700_000_000 + i, 20.0, 40.0, 0));
+        }
+        proto::apply_reply(&mut c, &mut r, 1, 2, &reply(1, 200, 0), 1);
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn reply_without_time_still_acks() {
+        let (mut c, mut r) = (Clock::default(), ring());
+        r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
+        proto::apply_reply(&mut c, &mut r, 1, 1, &reply(1, 1, 0), 5);
+        assert_eq!((r.len(), c.synced), (0, 0));
+    }
+
+    #[test]
+    fn sendable_prefix_stops_at_unsynced() {
+        let mut r = ring();
+        r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
+        r.push(Sample::new(42, 20.0, 40.0, TIME_UNSYNCED)); // taken before any sync, at RTC 42 s
+        r.push(Sample::new(1_700_000_120, 20.0, 40.0, 0));
+        assert_eq!(proto::sendable_prefix(&r, 16), 1);
+        assert_eq!(proto::sendable_prefix(&r, 0), 0);
+        let mut c = Clock::default();
+        let rep = reply(1, 0, 1_700_000_200_000_000);
+        proto::apply_reply(&mut c, &mut r, 1, 0, &rep, 100_000_000);
+        assert_eq!(proto::sendable_prefix(&r, 16), 3); // frozen to real time by the first reply
+        assert_eq!(r.get(1).ts_s, 1_700_000_142);
+    }
+
+    #[test]
+    fn nodes_full() {
+        let mut n = Nodes::new();
+        for i in 0..MAX_NODES as u8 {
+            assert!(n.slot([0, 0, 0, 0, 0, i]).is_some());
+        }
+        assert!(n.slot([0, 0, 0, 0, 1, 0]).is_none());
+        n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev = 5;
+        assert_eq!(n.slot([0, 0, 0, 0, 0, 3]).unwrap().dev, 5);
     }
 }

@@ -1,7 +1,7 @@
 //! What nodes and the gateway say to each other over ESP-NOW. Every frame starts
 //! `[MAGIC, VERSION, kind]`; fields follow little-endian, one by one.
 
-use crate::Sample;
+use crate::{Clock, Sample, SampleRing};
 
 pub const MAGIC: u8 = b'T';
 pub const VERSION: u8 = 1;
@@ -206,6 +206,36 @@ pub fn decode(b: &[u8]) -> Option<Frame> {
         })),
         _ => None,
     }
+}
+
+/// How many samples from the front of the ring can go in the next frame: those with epoch time,
+/// up to the first without, at most `max`. Frames carry a prefix so a reply's count pops exactly
+/// what was sent.
+pub fn sendable_prefix(ring: &SampleRing, max: usize) -> usize {
+    (0..ring.len().min(max))
+        .take_while(|&i| Clock::sendable(&ring.get(i)))
+        .count()
+}
+
+/// Applies the gateway's reply to a `Data` frame that carried `sent` samples under `nonce`. A
+/// reply to some other frame changes nothing and returns `false`. Time from a gateway that has none
+/// yet (0) is ignored, but its ack still counts.
+pub fn apply_reply(
+    clock: &mut Clock,
+    ring: &mut SampleRing,
+    nonce: u16,
+    sent: u8,
+    r: &Reply,
+    rtc_us: i64,
+) -> bool {
+    if r.nonce != nonce {
+        return false;
+    }
+    if r.epoch_us > 0 && clock.sync(rtc_us, r.epoch_us).is_ok() {
+        clock.freeze_unsynced(ring);
+    }
+    ring.pop(r.stored.min(sent) as usize);
+    true
 }
 
 #[cfg(test)]
