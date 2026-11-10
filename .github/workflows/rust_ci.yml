@@ -13,6 +13,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  WIFI_SSID: ci
+  WIFI_PASSWORD: ci-password
+  QUESTDB_ADDR: 127.0.0.1:9000
 
 jobs:
   rust-checks:

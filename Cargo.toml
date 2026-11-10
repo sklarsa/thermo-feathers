@@ -11,11 +11,22 @@ path = "./src/bin/main.rs"
 
 [dependencies]
 esp-hal                = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
+esp-rtos               = { version = "0.4.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3", "log-04"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
 esp-backtrace          = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
 esp-println            = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+esp-alloc              = { version = "0.11.0", features = ["esp32s3"] }
+esp-radio              = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi"] }
+embassy-executor       = { version = "0.10.0", features = ["log"] }
+embassy-net            = { version = "0.9.1", features = ["dhcpv4", "dns", "log", "medium-ethernet", "tcp", "udp"] }
+embassy-sync           = "0.8.0"
+embassy-time           = { version = "0.5.0", features = ["log"] }
+critical-section       = "1.2.0"
+static_cell            = "2.1.1"
 log                    = "0.4.27"
-qwp-embedded = { git = "https://github.com/sklarsa/qwp-embedded", rev = "7ff4370dd121c549be8196fe0aa2c0906a5bd1d1" }
+sntpc                  = { version = "0.11", default-features = false }
+sntpc-net-embassy      = { version = "0.11", default-features = false }
+qwp-embedded           = { git = "https://github.com/sklarsa/qwp-embedded", rev = "7ff4370dd121c549be8196fe0aa2c0906a5bd1d1", features = ["sender"] }
 
 [profile.dev]
 # The default debug profile is too slow and too big for resource-constrained devices.
