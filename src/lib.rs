@@ -174,6 +174,17 @@ impl SampleRing {
     }
 }
 
+/// The RTC's time since power-up on one fixed scale. esp-hal converts ticks to `us` with
+/// `cal_now`, a calibration it re-measures each boot, so its noise times hours of ticks moves the
+/// whole value by seconds between wakes. Rescaling to `cal_ref` (saved at cold boot) undoes that;
+/// the RC oscillator's real rate error is then constant, and Clock's ppm learns it.
+pub fn steady_us(us: u64, cal_now: u32, cal_ref: u32) -> i64 {
+    if cal_now == 0 {
+        return us as i64;
+    }
+    (us as u128 * cal_ref as u128 / cal_now as u128) as i64
+}
+
 /// RTC-to-epoch conversion, corrected for the RTC's measured rate (SPEC.md, Time sync).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -404,6 +415,20 @@ pub fn store_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// esp-hal turns the RTC's ticks since power-up into µs with a calibration it re-measures
+    /// every boot; a 0.3% change after 3 h moved every wake's time by 30 s.
+    #[test]
+    fn steady_us_ignores_per_boot_calibration() {
+        let cal_ref = 3_500_000; // µs per tick << 19, as saved at cold boot
+        let ticks: u128 = 1_500_000_000; // ~3 h of a 136 kHz RC
+        let us = |cal: u32| (ticks * cal as u128 >> 19) as u64;
+        let base = steady_us(us(cal_ref), cal_ref, cal_ref);
+        for cal in [cal_ref - 10_500, cal_ref + 10_500] {
+            assert!((steady_us(us(cal), cal, cal_ref) - base).abs() <= 1);
+        }
+        assert_eq!(steady_us(1234, 0, cal_ref), 1234); // no calibration: µs as given
+    }
 
     #[test]
     fn crc_matches_datasheet() {

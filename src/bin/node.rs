@@ -45,7 +45,7 @@ const REPLY_WAIT: Duration = Duration::from_millis(50);
 const HELLO_WAIT: Duration = Duration::from_millis(30);
 const RADIO_CAP: Duration = Duration::from_secs(2);
 
-const MAGIC: u32 = 0x7EF0_0003; // bump the low half when State's layout changes
+const MAGIC: u32 = 0x7EF0_0004; // bump the low half when State's layout changes
 
 /// Everything that survives deep sleep. Persistable: any bit pattern is valid.
 #[repr(C)]
@@ -54,6 +54,8 @@ struct State {
     boot_count: u32,
     dropped_samples: u32,
     reset_reason: u32,
+    /// esp-hal's slow-clock calibration at cold boot: the fixed scale for RTC time (steady_us).
+    cal_ref: u32,
     next_wake_rtc_us: i64,
     clock: Clock,
     battery_v: f32,
@@ -104,17 +106,28 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz));
     let reset = esp_hal::system::reset_reason();
     let rtc = Rtc::new(peripherals.RTC_TIMER);
-    let rtc_us = || rtc.time_since_power_up().as_micros() as i64;
-    let woke_us = rtc_us();
+    // esp-hal keeps this boot's slow-clock calibration in STORE1
+    let cal_now = esp_hal::peripherals::LPWR::regs().store1().read().bits();
 
     // SAFETY: the only reference, and nothing else runs yet
     let st = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
-    if reset != Some(SocResetReason::CoreDeepSleep) || st.magic != MAGIC {
+    let cold = reset != Some(SocResetReason::CoreDeepSleep) || st.magic != MAGIC;
+    let cal_ref = if cold { cal_now } else { st.cal_ref };
+    let rtc_us = || {
+        steady_us(
+            rtc.time_since_power_up().as_micros() as u64,
+            cal_now,
+            cal_ref,
+        )
+    };
+    let woke_us = rtc_us();
+    if cold {
         // ponytail: magic + wake cause, no CRC; a garbled header after a brownout is caught by
         // the reset reason, and SampleRing::fix guards the indexes either way
         // SAFETY: State is valid zeroed
         *st = unsafe { core::mem::zeroed() };
         st.magic = MAGIC;
+        st.cal_ref = cal_ref;
         st.next_wake_rtc_us = woke_us;
         st.battery_v = f32::NAN;
         st.battery_pct = f32::NAN;
