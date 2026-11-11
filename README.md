@@ -7,8 +7,8 @@ wall-powered gateway Feather, which forwards them to [QuestDB](https://questdb.c
 [qwp-embedded](https://github.com/sklarsa/qwp-embedded). Nodes never join WiFi. Every node runs the
 same image.
 
-[SPEC.md](SPEC.md) is the original design; the
-[v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) replaces its WiFi parts.
+[SPEC.md](SPEC.md) is the spec; the
+[v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) explains the move to ESP-NOW.
 **Status:** v2 milestone 1 done (deep-sleep wakes proven: 841 in a row on 2026-11-10); the ESP-NOW
 link is built and waiting for its hardware test.
 
