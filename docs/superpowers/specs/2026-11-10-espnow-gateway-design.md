@@ -265,16 +265,19 @@ soldering, one part.
 $14.95), on a STEMMA QT cable from the gateway's port (I2C0, SDA GPIO3, SCL GPIO4, GPIO7 high to
 power the port). I²C address 0x30. It runs on 3.3 V; greens and blues are dimmer than at 5 V.
 
-**Behaviour:**
-- Text scrolls in a 5×7 font. Only about 2 characters show at a time, so a room takes 4–5 s to
-  pass at about 20 columns a second.
-- One room after another: `Office 76° 41%`, in the web page's °F/°C unit, each tinted by its
-  temperature (blue cool, amber warm).
-- A red line only when something's wrong: a node stale after about 3 missed wakes, or its battery
-  under 10 %. For example `Bedroom no data 12m`.
-- Dim by default; brightness is a web-page setting.
-- If scrolling reads too slowly in practice, the fallback is a still two-digit temperature per room
-  in a colour per room.
+**Layouts**, chosen on the web page, mocked up live in `.superpowers/brainstorm/` on 2026-11-10:
+- **D (default): tiny letters, still.** Room initial and temperature in a 3×5 font (`O76`), a
+  humidity bar along the bottom two rows (length = % RH), 3 s per room.
+- **A: full line, scrolling.** `Office 76° 41%` in a 5×7 font, about 5 s per room at 20 columns/s.
+- **B: name and temperature, scrolling.** `Office 76°`.
+- **C: big still digits.** 5×7 temperature, 3 s per room; the bottom row shows which room.
+
+In every layout the temperature is tinted blue (cool) through white (about 72 °F) to amber (warm),
+and a node stale after about 3 missed wakes shows in red: blinking dashes in the still layouts,
+`Bedroom no data 12m` in the scrolling ones. The unit is the web page's °F/°C.
+
+**Web page settings**, kept in flash with the names: layout, scroll speed, brightness, and off or a
+night schedule. The page may also draw a live copy of the matrix.
 
 **Firmware:** a small no_std driver for the IS31FL3741 over esp-hal's async I²C (Adafruit's
 libraries are Arduino and Python only), a 5×7 font, and a task on the gateway that redraws from its
