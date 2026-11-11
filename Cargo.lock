@@ -1582,7 +1582,7 @@ dependencies = [
 [[package]]
 name = "qwp-embedded"
 version = "0.1.0"
-source = "git+https://github.com/sklarsa/qwp-embedded?rev=fc0b56fcb99d5758962748232bf8d4a8426aa612#fc0b56fcb99d5758962748232bf8d4a8426aa612"
+source = "git+https://github.com/sklarsa/qwp-embedded?rev=b15c0275841a5c7767928c44c12f6f05d4959349#b15c0275841a5c7767928c44c12f6f05d4959349"
 dependencies = [
  "embassy-net",
  "embassy-sync 0.8.0",
