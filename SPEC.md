@@ -30,7 +30,7 @@ the battery connector.
 | MAX17048 (on the Feather) | built in | Battery voltage and % | 0x36 |
 | SHT41 | 5776 | Temperature and humidity | 0x44 |
 | LiPo 3.7 V 1200 mAh | 258 | Power | n/a |
-| STEMMA QT cable 200–400 mm | 4401 / 5384 / 5385 | Keeps the sensor away from board heat | n/a |
+| STEMMA QT cable 50 mm | | SHT41 to the board, inside the enclosure | n/a |
 
 Pin and power rules:
 
