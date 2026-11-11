@@ -69,6 +69,11 @@ Beyond the ones in [SPEC.md](SPEC.md#open-questions):
 - Enclosure: not designed yet. Maybe something more whimsical than esp-light-show's house. It
   matters for the side-by-side check, since self-heating inside the enclosure is the main error.
 
+## Todo
+
+- Flash helper: wait for a node to show up on USB after RESET and flash it right away, so there's
+  no racing the 30 s window.
+
 ## License
 
 MIT
