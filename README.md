@@ -22,7 +22,7 @@ Per node. Everything is from Adafruit and plugs together, no soldering.
 | 1 | USB-C cable and 5 V USB power supply | | Flashing, charging, and plugged-in running |
 
 The enclosure is in [enclosure/](enclosure/main.scad): a core that holds everything, plus a plain
-snap-on cover, in PLA with no supports. The core is still a placeholder without board holders.
+snap-on cover, in PLA with no supports. Not test-printed yet.
 Pins and power rules are in [SPEC.md](SPEC.md#hardware).
 
 ## Build and flash
@@ -52,7 +52,7 @@ rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp
 
 Beyond the ones in [SPEC.md](SPEC.md#open-questions):
 
-- Enclosure: board holders and test prints for the core. It matters for the side-by-side check,
+- Enclosure: first print and fit. It matters for the side-by-side check,
   since self-heating inside the enclosure is the main error.
 
 ## License

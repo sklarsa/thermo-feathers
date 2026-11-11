@@ -1,8 +1,10 @@
 // The common core: holds the Feather, the battery and the SHT41, and carries the standard snap
 // interface every shell clicks onto.
 //
-// STAGE 1: a PLACEHOLDER. Right outer size and the right features in the right places, so shells
-// can be judged against it, but no board holders yet.
+// Open at the front. The Feather sits on two standoffs with pegs and a pad, its bottom edge tucked
+// under two fixed ledges and its top edge clicked under two hooks. The battery rests against the
+// hooks and a backstop; the SHT41 slides back under two corner ledges. The cover's ribs keep both
+// from sliding out. Prints back face down, no supports.
 //
 // Frame: x across (USB on the -x side), y depth from the back face (y = 0, towards the wall) to the
 // front, z up from the shelf. The node is a compact upright block with rounded corners:
@@ -41,11 +43,12 @@ corner_r = 6;                 // front-view corner radius of the core
 side_wall = 1.6;              // the cover's sleeve is the outer skin, so the core's sides can be thin
 qt_gap = 7;                   // back wall to board top: room for the STEMMA QT plug to turn
 board_y = wall + qt_gap;      // the board's component face
-batt_y = board_y + pcb + 1.2; // a 1.2 mm divider between board and battery
+batt_y = board_y + pcb + 1.6; // room for the board's hook lips and ledges between board and battery
 core_D = ceil(max(batt_y + batt[2] + tol * 2 + wall, sh + 2 * tol + 2 * wall));  // the SHT41 lies across the depth
 // extra room each side so the battery's square corners clear the rounded inside corners
 corner_room = (corner_r - side_wall) * (1 - 1 / sqrt(2));
-core_W = ceil(batt[0] + 2 * (tol + corner_room) + 2 * side_wall);
+core_W = ceil(batt[0] + 2 * (tol + corner_room) + 2 * side_wall + lead_room);
+batt_x = -core_W / 2 + side_wall + corner_room + tol + lead_room;  // the battery's -x end
 feet = 1.5;                   // the pocket floor sits this far off the shelf
 floor_t = 1.4;
 pocket_top = 11;              // SHT41 flat on rails, its plug, and air above
@@ -86,17 +89,62 @@ module usb_cut(shell = false) {
   if (shell) translate([-60, -5, usb_c.z - usb_open[1] / 2]) cube([60 + usb_face_x, usb_y1 + 5, usb_open[1]]);
 }
 
+// ---- Holders. Everything goes in from the open front; the cover's ribs keep the battery and the
+// SHT41 from sliding back out. ----
+qt_c = fpos(f_qt);
+board_front = board_y + pcb;
+hook_t = 1.6;                 // post thickness, the way it bends
+hook_len = board_front + 1.1 - wall;   // free length, back wall to the lip's top
+board_top = board_z + fh;
+top_hooks = [26, 40];         // board x of each top-edge hook, clear of the JST plug at 7-15
+ledges = [22, 38];            // board x of each fixed bottom-edge ledge, clear of the cable's slot
+echo(str("board hook strain ", round(strain(hook_t, hook_lip, hook_len) * 1000) / 10, " %"));
+
+// A hook over the board's top edge, flexing in z: a post from the back wall, a lip at its free end
+// that reaches hook_lip down over the board's front face, chamfered so the board pushes past.
+module top_hook(bx, w = 5) {
+  z0 = board_top + tol;
+  translate([board_x + bx - w / 2, 0, 0]) rotate([90, 0, 90]) linear_extrude(w)
+    polygon([[wall - 0.5, z0], [board_front + board_play, z0], [board_front + board_play, z0 - hook_lip - tol],
+             [board_front + 1.1, z0], [board_front + 1.1, z0 + hook_t], [wall - 0.5, z0 + hook_t + 1.2]]);
+}
+
+module holders() {
+  // standoffs and pegs at the two mounting holes by the USB end; the far holes sit under the module
+  for (h = [f_holes[0], f_holes[1]]) let(p = fpos(h)) {
+    translate([p.x, wall - 0.5, p.z]) rotate([-90, 0, 0]) cylinder(d = 3.8, h = board_y - wall + 0.5 - 0.01, $fn = 24);
+    translate([p.x, board_y - 0.01, p.z]) rotate([-90, 0, 0]) cylinder(d1 = peg_d, d2 = peg_d - 0.6, h = pcb, $fn = 16);
+  }
+  // pad behind the antenna end, past the module
+  translate([board_x + 49, wall - 0.5, board_z + 0.5]) cube([1.8, board_y - wall + 0.5 - 0.01, fh - 1]);
+  // fixed ledges over the bottom edge: tuck it under them, then press the top past the hooks
+  // Each sits on a shelf under the board's edge that rises from the back wall, so it prints
+  // (back face down) without hanging off the floor.
+  for (bx = ledges) translate([board_x + bx - 3, 0, elec_z0 + bay_floor - 0.01]) {
+    translate([0, wall - 0.5, 0]) cube([6, board_front + board_play - wall + 0.5, board_z - tol - elec_z0 - bay_floor + 0.01]);
+    translate([0, board_front + board_play, 0]) cube([6, 1.2, board_z - elec_z0 - bay_floor + ledge_lip + 0.01]);
+  }
+  for (bx = top_hooks) top_hook(bx);
+  // battery backstop where the board isn't
+  translate([board_x + fw + 1.5, wall - 0.5, elec_z0 + bay_floor - 0.01]) cube([1.6, batt_y - wall + 0.5, batt[1] - 6]);
+  // SHT41: two rails under it, and ledges over its back corners that it slides under
+  for (s = [-1, 1]) {
+    translate([s * 8 - 1, wall - 0.5, feet + floor_t - 0.01]) cube([2, (core_D + sh) / 2 - wall + 0.5, sht_z - feet - floor_t + 0.01]);
+    translate([s > 0 ? sw / 2 - 3 : -sw / 2, wall - 0.5, sht_z + pcb + 0.2]) cube([3, (core_D - sh) / 2 + 1 - wall + 0.5 + tol, 1.2]);
+  }
+}
+
 module core() {
+  holders();
   difference() {
     xz(0, core_D) core_outline();
-    // electronics bay and sensor pocket
-    xz(wall, core_D - 2 * wall) intersection() { inner_outline(); translate([-60, elec_z0 + bay_floor]) square([120, 100]); }
-    translate([-core_W / 2 + side_wall, wall, feet + floor_t]) cube([core_W - 2 * side_wall, core_D - 2 * wall, pocket_top - feet - floor_t + 0.01]);
+    // electronics bay and sensor pocket, both open at the front: the cover closes them
+    xz(wall, core_D) intersection() { inner_outline(); translate([-60, elec_z0 + bay_floor]) square([120, 100]); }
+    translate([-core_W / 2 + side_wall, wall, feet + floor_t]) cube([core_W - 2 * side_wall, core_D, pocket_top - feet - floor_t + 0.01]);
     // thermal break: open to the room at the sides and front, solid only along the back
     translate([-60, wall + 3, pocket_top]) cube([120, core_D, gap_h]);
-    // pocket front: almost all window, thin bars. The cover sits only shell_clear in front, so any
-    // cover vent over this window reaches the pocket.
-    for (x = [-24 : 6 : 24]) translate([x - 2.4, core_D - wall - 1, feet + floor_t + 0.8]) cube([4.8, wall + 2, pocket_top - feet - floor_t - 0.8]);
+    // the STEMMA QT cable's way down to the pocket, wide enough for its plug
+    translate([qt_c.x - 12, wall + 0.4, pocket_top - 1]) cube([7, 4, gap_h + bay_floor + 2]);
     for (s = [-1, 1]) for (z = [feet + floor_t + 2.2, feet + floor_t + 5.8]) translate([s > 0 ? 15 : -60, core_D / 2 + 1, z]) rotate([0, 90, 0]) linear_extrude(45) yslot(core_D - 7, 2.4);
     for (x = [-20 : 8 : 20]) translate([x - 1.5, wall + 2, -1]) cube([3, core_D - 2 * wall - 4, feet + floor_t + 2]);
     translate([-core_W / 2 + 6, -1, -1]) cube([core_W - 12, core_D + 2, feet + 1]);   // feet: a rail at each end
@@ -110,7 +158,7 @@ module core() {
 // ---- Hardware, as bounding solids from the board files ----
 module feather() {
   color("#1b1b1b") translate([board_x, board_y, board_z]) rotate([90, 0, 0]) mirror([0, 0, 1]) linear_extrude(pcb)
-    offset(r = 2.54, $fn = 24) offset(delta = -2.54) square([fw, fh]);
+    difference() { offset(r = 2.54, $fn = 24) offset(delta = -2.54) square([fw, fh]); for (h = f_holes) translate(h) circle(d = 2.2, $fn = 16); }
   translate([board_x, board_y, board_z]) {
     color("silver") translate([f_module[0], -2.4, f_module[1]]) cube([f_module[2], 2.4, f_module[3]]);        // S3 module
     color("silver") translate([f_usb[0] - 3.81, -3.26, f_usb[1] - 4.47]) cube([7.35, 3.26, 8.94]);         // USB-C
@@ -120,7 +168,7 @@ module feather() {
     color("orange") translate([f_chg[0] - 0.4, -0.6, f_chg[1] - 0.8]) cube([0.8, 0.6, 1.6]);
   }
 }
-module battery() color("#c9c9d4") translate([-batt[0] / 2, batt_y + tol, batt_z]) cube([batt[0], batt[2], batt[1]]);
+module battery() color("#c9c9d4") translate([batt_x, batt_y + tol, batt_z]) cube([batt[0], batt[2], batt[1]]);
 module sht41() translate([-sw / 2, (core_D - sh) / 2, sht_z]) {
   color("#1b1b1b") cube([sw, sh, pcb]);
   color("ivory") for (x = [0, sw - 5]) translate([x, sh / 2 - 3, pcb]) cube([5, 6, 3]);

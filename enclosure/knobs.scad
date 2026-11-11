@@ -5,12 +5,18 @@
 // so snap arms are longer and lips smaller, keeping bending strain under about 2 %. PLA softens
 // around 55 °C: keep nodes out of sunny windows.
 //
-// STAGE 1 (concept sheet): only the knobs the rough shells use are live. The board-holding knobs
-// arrive with the real core in stage 2.
 
 // ---- Fits ----
 tol = 0.3;          // gap around a board or the battery, from light-show
 shell_clear = 0.3;  // air between the core's outside and a shell's inside
+
+// ---- Holding the boards ----
+board_play = 0.1;   // air between the Feather and its hook lips and ledges; light-show used 0.05 in PETG
+hook_lip = 0.4;     // how far the top hooks reach over the Feather
+ledge_lip = 0.8;    // how far the fixed ledges reach over its bottom edge
+peg_d = 2.0;        // pegs in the 2.5 mm mounting holes
+lead_room = 4;      // free width at the battery's -x end for its leads to turn up to the JST
+cover_press = 0.3;  // air between the cover's ribs and the battery and SHT41 they keep in place
 
 // ---- Shell snap interface: tabs in the sleeve's side walls click over the core's back edge ----
 snap_lip = 0.5;     // how far a tab's lip reaches over the core's back edge

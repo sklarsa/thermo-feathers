@@ -28,12 +28,12 @@ module shown() if (turn) rotate([0, 0, 180]) children(); else children();
 
 if (part == "assembly") shown() { color(core_color) core(); hardware(); the_shell(); }
 if (part == "exploded") shown() { color(core_color) core(); hardware(); translate([0, explode, 0]) the_shell(); }
-if (part == "core") core();
+if (part == "core") rotate([90, 0, 0]) core();   // print orientation: back face on the bed
 if (part == "core_view") shown() { color(core_color) core(); hardware(); }
 if (part == "shell") shell_print() the_shell();
 if (part == "shell_view") shown() the_shell();
 if (part == "hardware") hardware();
-if (part == "check") intersection() { the_shell(c = 0); hardware(); }
+if (part == "check") { intersection() { the_shell(c = 0); hardware(); } intersection() { core(); hardware(); } }  // the cover touches the core only at its snap catches
 if (part == "palette") for (s = shells) echo(str("SHELL|", s[0], "|", s[1], "|", s[2][0], "|", s[2][1], "|", s[2][2], "|", s[2][3]));
 
 // Section through the snap tabs, seen from above. OpenCSG paints every cut face one colour, so

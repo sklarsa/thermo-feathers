@@ -69,6 +69,16 @@ module shell_body(rim) {
       offset(delta = -(edge_ch - i * 0.2)) art() union() { children(0); sleeve_outline(); } }
   }
   tab_lips();
+  cover_ribs();
+}
+
+// Ribs off the front plate's inside keep the battery and the SHT41 from sliding out of the open
+// front of the core, cover_press short of touching them.
+module cover_ribs() {
+  bf = batt_y + tol + batt[2] + cover_press;
+  for (dx = [-18, 18]) translate([batt_x + batt[0] / 2 + dx - 0.8, bf, batt_z + 6]) cube([1.6, shell_front_y - bf + 0.01, batt[1] - 12]);
+  sf = (core_D + sh) / 2 + cover_press;
+  translate([-6, sf, sht_z]) cube([12, shell_front_y - sf + 0.01, pcb]);
 }
 
 // rim: depth of the outline's own edge wall, for parts that stick out past the sleeve
