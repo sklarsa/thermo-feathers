@@ -54,8 +54,10 @@ scripts/ota.sh <gateway address> [all | id,id]   # build, then hand the image to
 or upload the `.bin` from `espflash save-image` on the gateway's Settings page. Each node fetches it
 at its next wake (if charging, or above 40 % battery), restarts into it, and keeps it once it hears
 from the gateway. If the new image never gets that far, the bootloader goes back to the old one at
-the next wake, and the gateway's page says the update rolled back. A node reports its build as
-`<version>-<6 hex>`, from the image's own SHA-256, so every build is told apart.
+the next wake, and the gateway's page says the update rolled back. A confirmed image that then
+crashes 3 wakes in a row, before reaching the gateway, goes back to the one before it too. A node
+reports its build as `<version>-<6 hex>`, from the image's own SHA-256, so every build is told
+apart.
 
 The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's
 the only device on WiFi, so it's the only build that needs credentials:
@@ -64,12 +66,26 @@ the only device on WiFi, so it's the only build that needs credentials:
 WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --release --bin gateway
 ```
 
+`cargo run` flashes the rollback bootloader too. After that first USB flash, the gateway updates
+over the network, with the same variables set:
+
+```sh
+scripts/ota.sh <gateway address> gateway
+```
+
+It writes the image to its other slot and restarts into it once QuestDB has everything it holds.
+The new image is kept once it reaches WiFi, the time server and QuestDB; otherwise it restarts after
+10 minutes and the bootloader goes back to the old one. Like the nodes, a confirmed gateway image
+that crashes 3 times in a row goes back to the one before it.
+
 It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address
 in your router so it stays put.
 
 Its web page, at that address, shows each room's latest reading, battery and last-seen time. Its
-Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C and
-sets the nodes' wake interval. Those settings live in the gateway's flash.
+Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C, sets
+the nodes' wake interval, and can override the build's QuestDB address and time server; a new
+QuestDB address takes a restart, which the gateway does itself. Those settings live in the
+gateway's flash. Node and gateway firmware can be uploaded there too.
 
 ## Host tests
 

@@ -15,9 +15,54 @@ pub const LOW_BATTERY_PCT: f32 = 10.0;
 /// A node is stale after this many missed wakes.
 pub const STALE_WAKES: u64 = 3;
 
-const MAGIC: [u8; 4] = *b"TFS1";
+const MAGIC_1: [u8; 4] = *b"TFS1";
+const MAGIC: [u8; 4] = *b"TFS2";
 const NAME_LEN: usize = 6 + 1 + NAME_MAX;
-pub const SETTINGS_LEN: usize = 4 + 1 + 2 + MAX_NODES * NAME_LEN + 1;
+/// TFS1: unit, wake interval, names. TFS2 adds the QuestDB address and time server after them.
+const V1_LEN: usize = 4 + 1 + 2 + MAX_NODES * NAME_LEN + 1;
+const QUESTDB_MAX: usize = 24;
+const NTP_MAX: usize = 48;
+pub const SETTINGS_LEN: usize = V1_LEN - 1 + 1 + QUESTDB_MAX + 1 + NTP_MAX + 1;
+
+/// A string setting; empty means the build's default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Text<const N: usize> {
+    len: u8,
+    buf: [u8; N],
+}
+
+impl<const N: usize> Text<N> {
+    const EMPTY: Self = Self {
+        len: 0,
+        buf: [0; N],
+    };
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
+    }
+
+    fn set(s: &str) -> Self {
+        let mut t = Self::EMPTY;
+        t.len = s.len() as u8;
+        t.buf[..s.len()].copy_from_slice(s.as_bytes());
+        t
+    }
+
+    fn put(&self, b: &mut [u8]) {
+        b[0] = self.len;
+        b[1..1 + N].copy_from_slice(&self.buf);
+    }
+
+    fn get(b: &[u8]) -> Self {
+        let mut t = Self::EMPTY;
+        let len = b[0] as usize;
+        if len <= N && core::str::from_utf8(&b[1..1 + len]).is_ok() {
+            t.len = b[0];
+            t.buf.copy_from_slice(&b[1..1 + N]);
+        }
+        t
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Name {
@@ -44,6 +89,8 @@ pub struct Settings {
     pub fahrenheit: bool,
     pub wake_s: u16,
     names: [Name; MAX_NODES],
+    questdb: Text<QUESTDB_MAX>,
+    ntp: Text<NTP_MAX>,
 }
 
 impl Default for Settings {
@@ -57,7 +104,40 @@ impl Settings {
         fahrenheit: true,
         wake_s: 60,
         names: [Name::EMPTY; MAX_NODES],
+        questdb: Text::EMPTY,
+        ntp: Text::EMPTY,
     };
+
+    /// QuestDB's `ip:port`; empty for the build's.
+    pub fn questdb(&self) -> &str {
+        self.questdb.as_str()
+    }
+
+    /// The SNTP server's name; empty for the build's.
+    pub fn ntp(&self) -> &str {
+        self.ntp.as_str()
+    }
+
+    pub fn set_questdb(&mut self, s: &str) -> Result<(), &'static str> {
+        let s = s.trim();
+        if !s.is_empty() && s.parse::<core::net::SocketAddrV4>().is_err() {
+            return Err("The QuestDB address is an IPv4 address and port, like 192.168.1.10:9000.");
+        }
+        self.questdb = Text::set(s);
+        Ok(())
+    }
+
+    pub fn set_ntp(&mut self, s: &str) -> Result<(), &'static str> {
+        let s = s.trim();
+        let ok = s.len() <= NTP_MAX
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if !ok {
+            return Err("The time server is a host name, like pool.ntp.org.");
+        }
+        self.ntp = Text::set(s);
+        Ok(())
+    }
 
     pub fn to_bytes(&self) -> [u8; SETTINGS_LEN] {
         let mut b = [0; SETTINGS_LEN];
@@ -69,13 +149,17 @@ impl Settings {
             c[6] = n.len;
             c[7..].copy_from_slice(&n.buf);
         }
+        self.questdb.put(&mut b[V1_LEN - 1..]);
+        self.ntp.put(&mut b[V1_LEN + QUESTDB_MAX..]);
         b[SETTINGS_LEN - 1] = crc8(&b[..SETTINGS_LEN - 1]);
         b
     }
 
-    /// `None` for erased flash, a torn write, or anything else that isn't ours.
+    /// `None` for erased flash, a torn write, or anything else that isn't ours. Reads TFS1 too.
     pub fn from_bytes(b: &[u8; SETTINGS_LEN]) -> Option<Self> {
-        if b[..4] != MAGIC || crc8(&b[..SETTINGS_LEN - 1]) != b[SETTINGS_LEN - 1] {
+        let v1 = b[..4] == MAGIC_1;
+        let end = if v1 { V1_LEN } else { SETTINGS_LEN };
+        if !(v1 || b[..4] == MAGIC) || crc8(&b[..end - 1]) != b[end - 1] {
             return None;
         }
         let mut s = Self {
@@ -90,6 +174,10 @@ impl Settings {
                 n.len = c[6];
                 n.buf.copy_from_slice(&c[7..]);
             }
+        }
+        if !v1 {
+            s.questdb = Text::get(&b[V1_LEN - 1..]);
+            s.ntp = Text::get(&b[V1_LEN + QUESTDB_MAX..]);
         }
         Some(s)
     }
@@ -231,7 +319,8 @@ impl Rollout {
         if let Some(p) = self.get(id) {
             if *fw == new {
                 *p = Progress::Done;
-            } else if *p == Progress::Sent {
+            } else if matches!(*p, Progress::Sent | Progress::Done) {
+                // back on its old build: it never confirmed the new one
                 *p = Progress::Failed;
             }
         }
@@ -280,7 +369,9 @@ fn rollout_line(w: &mut impl Write, r: Option<&Rollout>, id: &[u8; 6]) -> fmt::R
 
 /// The gateway's own state, for the page's footer.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Gateway {
+pub struct Gateway<'a> {
+    /// The gateway's own build ID.
+    pub fw: [u8; 12],
     pub up_s: u64,
     pub channel: u32,
     pub time_synced: bool,
@@ -288,8 +379,11 @@ pub struct Gateway {
     pub waiting: usize,
     /// qwp-embedded's `Stats::last_error`.
     pub last_error: u32,
-    /// QuestDB's ip:port, for a link to its web console.
-    pub questdb: &'static str,
+    /// QuestDB's ip:port in use, for a link to its web console.
+    pub questdb: &'a str,
+    /// The build's QuestDB address and time server, shown when the settings leave them empty.
+    pub questdb_default: &'a str,
+    pub ntp_default: &'a str,
 }
 
 /// HTML-escaped text.
@@ -369,13 +463,16 @@ document.querySelector('details[open]'))return;try{const t=await(await fetch('/'
 const n=new DOMParser().parseFromString(t,'text/html').getElementById('rooms');\
 if(n)document.getElementById('rooms').replaceWith(n)}catch(e){}},30000)</script>";
 
-/// Sends the chosen file as the raw body of `POST /update?to=<ids>`.
-const UPLOAD: &str = "<script>up.onsubmit=async e=>{e.preventDefault();\
+/// Sends a chosen file as the raw body: node firmware to `POST /update?to=<ids>`, gateway firmware
+/// to `POST /update/gateway`.
+const UPLOAD: &str = "<script>async function send(url,file,msg,wait){msg.textContent='Uploading…';\
+try{const r=await fetch(url,{method:'POST',body:file});msg.textContent=await r.text();\
+if(r.ok)setTimeout(()=>location.reload(),wait)}catch(e){msg.textContent='Upload failed: '+e}}\
+up.onsubmit=e=>{e.preventDefault();\
 const to=[...up.querySelectorAll('[name=to]:checked')].map(c=>c.value).join(',');\
-if(!to){upmsg.textContent='Pick at least one node.';return}upmsg.textContent='Uploading…';\
-try{const r=await fetch('/update?to='+to,{method:'POST',body:img.files[0]});\
-upmsg.textContent=await r.text();if(r.ok)setTimeout(()=>location.reload(),1500)}\
-catch(e){upmsg.textContent='Upload failed: '+e}}</script>";
+if(!to){upmsg.textContent='Pick at least one node.';return}\
+send('/update?to='+to,img.files[0],upmsg,1500)};\
+gw.onsubmit=e=>{e.preventDefault();send('/update/gateway',gwimg.files[0],gwmsg,30000)}</script>";
 
 /// A line above the page: what was just saved, or why it wasn't.
 pub type Note<'a> = Option<Result<&'a str, &'a str>>;
@@ -527,7 +624,12 @@ pub fn render_home(
     if !g.time_synced {
         w.write_str(" · <span class=bad>no time yet</span>")?;
     }
-    write!(w, " · up {}</footer></div>", Age(g.up_s))?;
+    write!(
+        w,
+        " · fw {} · up {}</footer></div>",
+        Esc(fw_str(&g.fw)),
+        Age(g.up_s)
+    )?;
     w.write_str(UNSAVE)?;
     w.write_str(REFRESH)?;
     w.write_str("</main></body></html>")
@@ -539,6 +641,7 @@ pub fn render_settings(
     s: &Settings,
     nodes: &Nodes,
     rollout: Option<&Rollout>,
+    g: &Gateway,
     n: Note,
 ) -> fmt::Result {
     w.write_str(HEAD)?;
@@ -554,10 +657,21 @@ pub fn render_settings(
          <label>Wake interval, seconds<input type=number name=wake min={WAKE_MIN_S} \
          max={WAKE_MAX_S} value={}><small>How often each node reads and sends, from {WAKE_MIN_S} \
          to {WAKE_MAX_S}. Nodes switch at their next send; shorter drains batteries faster.\
-         </small></label><button>Save</button></form>",
+         </small></label>\
+         <label>QuestDB address<input name=questdb value=\"{}\" placeholder=\"{}\" \
+         maxlength={QUESTDB_MAX}><small>ip:port of its HTTP endpoint. Empty for the one built \
+         in. The gateway restarts to use a new one, once what it holds has reached the old one.\
+         </small></label>\
+         <label>Time server<input name=ntp value=\"{}\" placeholder=\"{}\" maxlength={NTP_MAX}>\
+         <small>Empty for the one built in.</small></label>\
+         <button>Save</button></form>",
         if s.fahrenheit { " selected" } else { "" },
         if s.fahrenheit { "" } else { " selected" },
-        s.wake_s
+        s.wake_s,
+        Esc(s.questdb()),
+        Esc(g.questdb_default),
+        Esc(s.ntp()),
+        Esc(g.ntp_default),
     )?;
     w.write_str(
         "<p class=sub>To rename a room, tap its name on the Rooms page. Each rename is also a \
@@ -582,6 +696,16 @@ pub fn render_settings(
         "<button>Upload</button><small id=upmsg></small></form><p class=sub>Each node fetches it \
          at its next wake if charging or above 40 % battery, restarts into it, and goes back to its \
          old firmware if the new one doesn't reach the gateway on its first try.</p>",
+    )?;
+    write!(
+        w,
+        "<h1>Gateway firmware</h1><form class=stack id=gw><label>Image (.bin, built with this \
+         network's WiFi settings)<input type=file id=gwimg accept=.bin required></label>\
+         <button>Upload and restart</button><small id=gwmsg></small></form><p class=sub>Running \
+         {}. The gateway writes the image to its other slot and restarts into it. It goes back to \
+         this one if the new one hasn't reached WiFi, the time server and QuestDB within 10 \
+         minutes.</p>",
+        Esc(fw_str(&g.fw))
     )?;
     w.write_str(UPLOAD)?;
     w.write_str(UNSAVE)?;
@@ -690,6 +814,21 @@ mod tests {
         let b = s.to_bytes();
         assert_eq!(Settings::from_bytes(&b), Some(s));
         assert_eq!(Settings::from_bytes(&[0xFF; SETTINGS_LEN]), None); // erased flash
+        let mut q = s;
+        q.set_questdb(" 10.0.0.2:9000 ").unwrap();
+        q.set_ntp("time.example.com").unwrap();
+        assert_eq!(Settings::from_bytes(&q.to_bytes()), Some(q));
+        assert_eq!(
+            (q.questdb(), q.ntp()),
+            ("10.0.0.2:9000", "time.example.com")
+        );
+        assert!(q.set_questdb("questdb:9000").is_err() && q.set_ntp("a b").is_err());
+        // a TFS1 save from before: its names and unit survive, the new fields start empty
+        let mut old = [0u8; SETTINGS_LEN];
+        old[..V1_LEN - 1].copy_from_slice(&b[..V1_LEN - 1]);
+        old[..4].copy_from_slice(&MAGIC_1);
+        old[V1_LEN - 1] = crc8(&old[..V1_LEN - 1]);
+        assert_eq!(Settings::from_bytes(&old), Some(s));
         let mut torn = b;
         torn[20] ^= 1;
         assert_eq!(Settings::from_bytes(&torn), None);
@@ -753,10 +892,13 @@ mod tests {
         n.heard(low, &[Sample::new(1, 20.0, 41.0, 0)]);
         n.heard(seen(b"bbbbbb", 0), &[Sample::new(1, 22.0, 40.0, 0)]);
         let g = Gateway {
+            fw: *b"0.4.0-a1b2c3",
             up_s: 300,
             channel: 6,
             time_synced: true,
             questdb: "10.0.0.2:9000",
+            questdb_default: "10.0.0.2:9000",
+            ntp_default: "pool.ntp.org",
             ..Default::default()
         };
         let mut h = String::new();
@@ -774,7 +916,8 @@ mod tests {
         assert!(h.contains("value=bbbbbb") && h.contains("value=\"Attic\""));
         assert!(h.contains("<summary>bbbbbb</summary>")); // unnamed: the ID is the name
         let mut h = String::new();
-        render_settings(&mut h, &s, &n, None, Some(Err("nope"))).unwrap();
+        render_settings(&mut h, &s, &n, None, &g, Some(Err("nope"))).unwrap();
+        assert!(h.contains("Running 0.4.0-a1b2c3") && h.contains("placeholder=\"10.0.0.2:9000\""));
         assert!(h.contains("name=to value=bbbbbb checked"));
         assert!(h.contains("class='note bad'>nope") && h.contains("value=60"));
     }
@@ -795,6 +938,10 @@ mod tests {
         assert!(r.fetch(&a, 256)); // its answer got lost: asked again
         r.heard(&a, &new);
         assert_eq!(r.progress(&a), Some(Progress::Done));
+        // its trial boot's first frame reported the new build, but it never confirmed: rolled back
+        let mut r2 = r;
+        r2.heard(&a, &old);
+        assert_eq!(r2.progress(&a), Some(Progress::Failed));
         // b gets it all but comes back on its old build: rolled back, and left alone
         r.fetch(&b, 256);
         r.heard(&b, &old);

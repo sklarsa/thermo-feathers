@@ -46,10 +46,15 @@ pub fn entry(seq: u32, state: u32) -> [u8; 32] {
     e
 }
 
+/// An entry the bootloader will go by: like ESP-IDF's, it skips rolled-back ones.
+fn live(e: &[u8; 32]) -> Option<(u32, u32)> {
+    parse(e).filter(|&(_, state)| state != INVALID && state != ABORTED)
+}
+
 /// The entry the bootloader goes by: (which of the two, seq, state). `None` when neither is
-/// valid, as after a USB flash: the bootloader boots slot 0 then.
+/// live, as after a USB flash: the bootloader boots slot 0 then.
 pub fn current(e0: &[u8; 32], e1: &[u8; 32]) -> Option<(usize, u32, u32)> {
-    match (parse(e0), parse(e1)) {
+    match (live(e0), live(e1)) {
         (Some(a), Some(b)) if b.0 > a.0 => Some((1, b.0, b.1)),
         (Some(a), _) => Some((0, a.0, a.1)),
         (None, Some(b)) => Some((1, b.0, b.1)),
@@ -70,6 +75,20 @@ pub fn switch_to(e0: &[u8; 32], e1: &[u8; 32], to: usize) -> (usize, [u8; 32]) {
         None => (0, to as u32 + 1),
     };
     (which, entry(seq, NEW))
+}
+
+/// For a confirmed image that keeps crashing: what to write, and to which entry, to boot the
+/// other slot again, if otadata still names it as a good image. `booted` is the slot running now.
+pub fn fall_back(e0: &[u8; 32], e1: &[u8; 32], booted: usize) -> Option<(usize, [u8; 32])> {
+    let (cur, seq, _) = current(e0, e1)?;
+    let other = if cur == 0 { e1 } else { e0 };
+    let (old, state) = live(other)?;
+    let to = 1 - booted;
+    if state != VALID || slot_of(old) != to {
+        return None;
+    }
+    let seq = seq + if slot_of(seq + 1) == to { 1 } else { 2 };
+    Some((1 - cur, entry(seq, VALID)))
 }
 
 #[cfg(test)]
@@ -114,11 +133,28 @@ mod tests {
         // running slot 1 (seq 2 in entry 0): back to slot 0 is seq 3, in entry 1
         let e0 = entry(2, VALID);
         assert_eq!(switch_to(&e0, &ERASED, 0), (1, entry(3, NEW)));
-        // a rolled-back seq 2 (slot 1) while slot 0 runs: slot 1 again is seq 4
+        // a rolled-back seq 2 while slot 0 runs: the bootloader ignores it, and so do we
         let e0 = entry(2, ABORTED);
-        assert_eq!(switch_to(&e0, &ERASED, 1), (1, entry(4, NEW)));
-        let (w, e) = switch_to(&e0, &ERASED, 1);
-        let (e0, e1) = if w == 0 { (e, e0) } else { (e0, e) };
-        assert_eq!(current(&e0, &e1).map(|c| slot_of(c.1)), Some(1));
+        assert_eq!(current(&e0, &ERASED), None);
+        assert_eq!(switch_to(&e0, &ERASED, 1), (0, entry(2, NEW)));
+        // slot 1 confirmed (seq 2), then a slot 0 update rolled back (seq 3): the next update
+        // must not write over seq 2, the entry slot 1 boots by
+        let (good, bad) = (entry(2, VALID), entry(3, ABORTED));
+        assert_eq!(current(&good, &bad), Some((0, 2, VALID)));
+        assert_eq!(switch_to(&good, &bad, 0), (1, entry(3, NEW)));
+    }
+
+    #[test]
+    fn falling_back() {
+        // slot 1 confirmed at seq 2, then slot 0 confirmed at seq 3 and crashing: back to slot 1
+        let (e0, e1) = (entry(2, VALID), entry(3, VALID));
+        assert_eq!(fall_back(&e0, &e1, 0), Some((0, entry(4, VALID))));
+        let (w, e) = fall_back(&e0, &e1, 0).unwrap();
+        let (e0b, e1b) = if w == 0 { (e, e1) } else { (e0, e) };
+        assert_eq!(current(&e0b, &e1b).map(|c| slot_of(c.1)), Some(1));
+        // nothing good to go back to: after a USB flash, or when the other was rolled back
+        assert_eq!(fall_back(&ERASED, &ERASED, 0), None);
+        assert_eq!(fall_back(&entry(2, ABORTED), &entry(3, VALID), 0), None);
+        assert_eq!(fall_back(&ERASED, &entry(3, VALID), 0), None);
     }
 }

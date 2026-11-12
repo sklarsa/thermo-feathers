@@ -40,6 +40,9 @@ use sha2::{Digest, Sha256};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 use thermo_feathers::image;
+
+#[path = "../flash.rs"]
+mod flash;
 use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, Reply, UPDATE};
 use thermo_feathers::web::{self, Nodes, Rollout, SETTINGS_LEN, Seen, Settings};
 use thermo_feathers::*;
@@ -72,6 +75,12 @@ const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
 const QUESTDB: &str = env!("QUESTDB_ADDR"); // ip:port of QuestDB's HTTP endpoint, e.g. 192.168.1.10:9000
 const NTP_SERVER: &str = "pool.ntp.org";
+const GATEWAY_PROJECT: &str = "thermo-gateway";
+/// A new gateway image that hasn't reached WiFi, the time server and QuestDB by then restarts,
+/// and the bootloader goes back to the old one.
+const TRIAL: Duration = Duration::from_secs(600);
+/// How long a restart waits for the ring to reach QuestDB: nodes deleted what's in it.
+const DRAIN: Duration = Duration::from_secs(30);
 
 /// partitions.csv's `settings` partition: names, unit and wake interval.
 const SETTINGS_ADDR: u32 = 0xA000;
@@ -93,6 +102,17 @@ static UI: BlockingMutex<CriticalSectionRawMutex, RefCell<(Settings, Nodes)>> =
     BlockingMutex::new(RefCell::new((Settings::DEFAULT, Nodes::EMPTY)));
 static QWP_STATS: Stats = Stats::new();
 
+/// Settings and updates write flash from more than one task.
+static FLASH: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<FlashStorage<'static>>>> =
+    BlockingMutex::new(RefCell::new(None));
+/// This image's build ID.
+static GW_FW: BlockingMutex<CriticalSectionRawMutex, Cell<[u8; 12]>> =
+    BlockingMutex::new(Cell::new([0; 12]));
+
+fn with_flash<R>(f: impl FnOnce(&mut FlashStorage<'static>) -> R) -> Option<R> {
+    FLASH.lock(|fl| fl.borrow_mut().as_mut().map(f))
+}
+
 /// Node firmware waiting in PSRAM, and which nodes are to get it. `buf` is out while an upload
 /// writes into it, and `rollout` is `None` then.
 struct Image {
@@ -110,9 +130,29 @@ static IMAGE: BlockingMutex<CriticalSectionRawMutex, RefCell<Image>> =
 
 type Shared = &'static SharedRing<Rec>;
 
+/// Panics since the gateway was last healthy, through restarts: `[PANIC_MAGIC, count]`.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut PANICS: [u32; 2] = [0; 2];
+const PANIC_MAGIC: u32 = 0x7EF0_6A7E;
+/// Panics in a row, without becoming healthy, before a confirmed image gives way to the one
+/// before it.
+const PANICS_TO_FALL_BACK: u32 = 3;
+
+fn panics() -> u32 {
+    // SAFETY: two words, only touched from the boot path, custom_halt and `healthy`, one at a time
+    let p = unsafe { *core::ptr::addr_of!(PANICS) };
+    if p[0] == PANIC_MAGIC { p[1] } else { 0 }
+}
+
+fn set_panics(n: u32) {
+    // SAFETY: as in `panics`
+    unsafe { *core::ptr::addr_of_mut!(PANICS) = [PANIC_MAGIC, n] };
+}
+
 /// A panic reboots: the gateway is on wall power, and a reboot loses only what QuestDB hadn't acked.
 #[unsafe(no_mangle)]
 fn custom_halt() -> ! {
+    set_panics(panics().saturating_add(1));
     esp_hal::system::software_reset()
 }
 
@@ -138,6 +178,26 @@ async fn main(spawner: Spawner) -> ! {
         Some(s) => UI.lock(|u| u.borrow_mut().0 = s),
         None => info!("settings: none saved, using defaults"),
     }
+    let fw = flash::build_id(&mut flash, env!("CARGO_PKG_VERSION"));
+    GW_FW.lock(|f| f.set(fw));
+    let trial = flash::on_trial(&mut flash);
+    // A confirmed image that keeps crashing: the bootloader only rolls back unconfirmed ones.
+    if !trial && panics() >= PANICS_TO_FALL_BACK {
+        set_panics(0);
+        if flash::fall_back(&mut flash) {
+            esp_hal::system::software_reset();
+        }
+    }
+    info!(
+        "fw {}{}",
+        core::str::from_utf8(&fw).unwrap_or("?"),
+        if trial { ", on trial" } else { "" }
+    );
+    FLASH.lock(|f| *f.borrow_mut() = Some(flash));
+    let questdb = UI.lock(|u| u.borrow().0.questdb().parse().ok());
+    let questdb =
+        questdb.unwrap_or_else(|| QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port"));
+    info!("questdb: {questdb}");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
@@ -198,11 +258,13 @@ async fn main(spawner: Spawner) -> ! {
                 tcp_rx: mk_static!([u8; 2048], [0u8; 2048]),
                 scratch,
             },
+            questdb,
         )
         .unwrap(),
     );
     spawner.spawn(report(stack, ring).unwrap());
-    spawner.spawn(http(stack, ring, flash).unwrap());
+    spawner.spawn(http(stack, ring).unwrap());
+    spawner.spawn(healthy(trial).unwrap());
 
     espnow(esp, ring).await
 }
@@ -422,10 +484,15 @@ async fn net_task(mut runner: Runner<'static, Interface>) {
 }
 
 #[embassy_executor::task]
-async fn sender(stack: Stack<'static>, ring: Shared, buffers: Buffers<Rec>) {
+async fn sender(
+    stack: Stack<'static>,
+    ring: Shared,
+    buffers: Buffers<Rec>,
+    addr: core::net::SocketAddrV4,
+) {
     let rng = Rng::new();
     let config = sender::Config {
-        addr: QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port"),
+        addr,
         client_id: concat!("thermo-gateway/", env!("CARGO_PKG_VERSION")),
         symbols: &SYMBOLS,
         batch_interval: Duration::from_millis(100),
@@ -490,8 +557,13 @@ async fn sntp_task(stack: Stack<'static>) {
     sock.bind(123).unwrap();
     let sock = UdpSocketWrapper::new(sock);
     loop {
+        let settings = UI.lock(|u| u.borrow().0);
+        let server = match settings.ntp() {
+            "" => NTP_SERVER,
+            s => s,
+        };
         let ok = with_timeout(Duration::from_secs(5), async {
-            let addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.ok()?;
+            let addrs = stack.dns_query(server, DnsQueryType::A).await.ok()?;
             let server = SocketAddr::from((IpAddr::from(*addrs.first()?), 123));
             get_time(server, &sock, NtpContext::new(NtpNow(0)))
                 .await
@@ -517,7 +589,7 @@ async fn sntp_task(stack: Stack<'static>) {
 
 /// The web page, one connection at a time.
 #[embassy_executor::task]
-async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'static>) {
+async fn http(stack: Stack<'static>, ring: Shared) {
     let (mut rx, mut tx) = ([0u8; 1536], [0u8; 2048]);
     let mut req = [0u8; 1536];
     stack.wait_config_up().await;
@@ -528,6 +600,7 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
             continue;
         }
         let mut len = 0;
+        let mut restart = false;
         let head = loop {
             if let Some(h) = web::parse_head(&req[..len]) {
                 if h.post && h.path == b"/update" {
@@ -537,6 +610,14 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
                     to[..q].copy_from_slice(&h.query[..q]);
                     let early = len.min(at + cl);
                     let resp = upload(&mut sock, &req[at..early], cl, &to[..q]).await;
+                    write_all(&mut sock, resp.as_bytes()).await;
+                    break None;
+                }
+                if h.post && h.path == b"/update/gateway" {
+                    let (at, cl) = (h.len, h.content_length);
+                    let early = len.min(at + cl);
+                    let resp;
+                    (resp, restart) = self_update(&mut sock, &req[at..early], cl).await;
                     write_all(&mut sock, resp.as_bytes()).await;
                     break None;
                 }
@@ -570,12 +651,61 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
                 }
             }
             if len >= end {
-                let resp = respond(route, &req[at..end], ring, &mut flash);
+                let resp;
+                (resp, restart) = respond(route, &req[at..end], ring);
                 write_all(&mut sock, resp.as_bytes()).await;
             }
         }
         sock.close();
         let _ = with_timeout(Duration::from_secs(2), sock.flush()).await;
+        if restart {
+            restart_when_drained(ring).await;
+        }
+    }
+}
+
+/// Restarts once the ring has reached QuestDB, or after DRAIN: its records are acked to nodes,
+/// which deleted their copies.
+async fn restart_when_drained(ring: Shared) -> ! {
+    let t0 = Instant::now();
+    while ring.lock(|r| r.borrow().len()) > 0 && t0.elapsed() < DRAIN {
+        Timer::after_millis(200).await;
+    }
+    let left = ring.lock(|r| r.borrow().len());
+    if left > 0 {
+        warn!("restarting with {left} records QuestDB hasn't acked");
+    }
+    info!("restarting");
+    Timer::after_millis(100).await;
+    esp_hal::system::software_reset()
+}
+
+/// Waits for WiFi, the time and a QuestDB ack. Then the panic count starts over, and a new image
+/// on trial is kept. One that doesn't get there within TRIAL restarts, and the bootloader goes
+/// back to the old one.
+#[embassy_executor::task]
+async fn healthy(trial: bool) {
+    let t0 = Instant::now();
+    loop {
+        if WIFI_CHANNEL.load(Relaxed) != 0
+            && SYNCED.load(Relaxed)
+            && QWP_STATS.acks.load(Relaxed) > 0
+        {
+            set_panics(0);
+            if trial {
+                with_flash(flash::confirm);
+            }
+            return;
+        }
+        if trial && t0.elapsed() > TRIAL {
+            error!(
+                "on trial for {} s without WiFi, time and QuestDB: going back",
+                TRIAL.as_secs()
+            );
+            Timer::after_millis(100).await;
+            esp_hal::system::software_reset();
+        }
+        Timer::after_secs(5).await;
     }
 }
 
@@ -587,23 +717,25 @@ enum Route {
     NotFound,
 }
 
-fn respond(
-    route: Route,
-    body: &[u8],
-    ring: Shared,
-    flash: &mut FlashStorage,
-) -> alloc::string::String {
-    use core::fmt::Write;
+/// The response, and whether the gateway restarts after sending it.
+fn respond(route: Route, body: &[u8], ring: Shared) -> (alloc::string::String, bool) {
     let mut page = alloc::string::String::new();
     let (settings, nodes) = UI.lock(|u| *u.borrow());
     let rollout = IMAGE.lock(|i| i.borrow().rollout);
+    let questdb = match settings.questdb() {
+        "" => QUESTDB,
+        q => q,
+    };
     let gateway = || web::Gateway {
+        fw: GW_FW.lock(|f| f.get()),
         up_s: Instant::now().as_secs(),
         channel: WIFI_CHANNEL.load(Relaxed),
         time_synced: SYNCED.load(Relaxed),
         waiting: ring.lock(|r| r.borrow().len()),
         last_error: QWP_STATS.last_error.load(Relaxed),
-        questdb: QUESTDB,
+        questdb,
+        questdb_default: QUESTDB,
+        ntp_default: NTP_SERVER,
     };
     let _ = match route {
         Route::Home(n) => web::render_home(
@@ -614,11 +746,16 @@ fn respond(
             rollout.as_ref(),
             n,
         ),
-        Route::Settings(n) => {
-            web::render_settings(&mut page, &settings, &nodes, rollout.as_ref(), n)
-        }
-        Route::Rename => match rename(body, ring, flash) {
-            Ok(()) => return see_other("/saved"),
+        Route::Settings(n) => web::render_settings(
+            &mut page,
+            &settings,
+            &nodes,
+            rollout.as_ref(),
+            &gateway(),
+            n,
+        ),
+        Route::Rename => match rename(body, ring) {
+            Ok(()) => return (see_other("/saved"), false),
             Err(msg) => web::render_home(
                 &mut page,
                 &settings,
@@ -639,20 +776,51 @@ fn respond(
             if let Some(w) = wake {
                 s.wake_s = w.clamp(WAKE_MIN_S, WAKE_MAX_S);
             }
-            UI.lock(|u| u.borrow_mut().0 = s);
-            save(flash, &s);
-            info!(
-                "settings: {} wake {} s",
-                if s.fahrenheit { "°F" } else { "°C" },
-                s.wake_s
+            let (mut qb, mut nb) = ([0u8; 64], [0u8; 128]);
+            let fields = (
+                web::form_value(body, "questdb", &mut qb),
+                web::form_value(body, "ntp", &mut nb),
             );
-            return see_other("/settings/saved");
+            let checked = match fields {
+                (Some(q), Some(n)) => s.set_questdb(q).and_then(|()| s.set_ntp(n)),
+                _ => Err("Those fields are too long."),
+            };
+            if let Err(msg) = checked {
+                let _ = web::render_settings(
+                    &mut page,
+                    &settings,
+                    &nodes,
+                    rollout.as_ref(),
+                    &gateway(),
+                    Some(Err(msg)),
+                );
+                return (html(&page), false);
+            }
+            UI.lock(|u| u.borrow_mut().0 = s);
+            save(&s);
+            info!(
+                "settings: {} wake {} s, questdb {:?}, ntp {:?}",
+                if s.fahrenheit { "°F" } else { "°C" },
+                s.wake_s,
+                s.questdb(),
+                s.ntp()
+            );
+            // the sender takes its address once, at boot
+            let restart = s.questdb() != settings.questdb();
+            return (see_other("/settings/saved"), restart);
         }
         Route::NotFound => {
-            return "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                .into();
+            return (
+                "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                false,
+            );
         }
     };
+    (html(&page), false)
+}
+
+fn html(page: &str) -> alloc::string::String {
+    use core::fmt::Write;
     let mut resp = alloc::string::String::with_capacity(page.len() + 128);
     let _ = write!(
         resp,
@@ -670,7 +838,7 @@ fn see_other(to: &str) -> alloc::string::String {
 }
 
 /// A rename from the form: saved to flash, and to `device_locations` once the gateway has time.
-fn rename(body: &[u8], ring: Shared, flash: &mut FlashStorage) -> Result<(), &'static str> {
+fn rename(body: &[u8], ring: Shared) -> Result<(), &'static str> {
     let (mut ib, mut nb) = ([0u8; 6], [0u8; 128]);
     let id: [u8; 6] = web::form_value(body, "id", &mut ib)
         .filter(|i| i.len() == 6 && i.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -689,7 +857,7 @@ fn rename(body: &[u8], ring: Shared, flash: &mut FlashStorage) -> Result<(), &'s
         (u.0, stored)
     });
     let stored = stored.ok_or("No room for another name: clear one first.")?;
-    save(flash, &s);
+    save(&s);
     let room = core::str::from_utf8(&copy[..stored]).unwrap_or("");
     info!("rename {}: {room:?}", id_str(&id));
     if room.is_empty() {
@@ -718,8 +886,8 @@ fn rename(body: &[u8], ring: Shared, flash: &mut FlashStorage) -> Result<(), &'s
     Ok(())
 }
 
-fn save(flash: &mut FlashStorage, s: &Settings) {
-    if let Err(e) = flash.write(SETTINGS_ADDR, &s.to_bytes()) {
+fn save(s: &Settings) {
+    if let Some(Err(e)) = with_flash(|f| f.write(SETTINGS_ADDR, &s.to_bytes())) {
         error!("settings: flash write failed: {e:?}");
     }
 }
@@ -749,6 +917,10 @@ async fn upload(
     len: usize,
     query: &[u8],
 ) -> alloc::string::String {
+    let (ids, n) = match targets(query).and_then(|t| fits(len).map(|()| t)) {
+        Ok(t) => t,
+        Err(e) => return text("400 Bad Request", &alloc::format!("Refused: {e}")),
+    };
     let Some(img) = IMAGE.lock(|i| {
         let mut i = i.borrow_mut();
         i.rollout = None;
@@ -758,7 +930,7 @@ async fn upload(
     };
     let res = receive(sock, img, early, len)
         .await
-        .and_then(|()| check(&img[..len], query));
+        .and_then(|()| check(&img[..len], &ids[..n]));
     let msg = match &res {
         Ok((r, _)) => {
             let n = r.targets.iter().flatten().count();
@@ -809,8 +981,8 @@ async fn receive(
     Ok(())
 }
 
-/// A whole, intact node image, and which nodes `to` names.
-fn check(img: &[u8], query: &[u8]) -> Result<(Rollout, [u8; 32]), &'static str> {
+/// A whole, intact app image of `project`: its version and its own SHA-256.
+fn check_image<'a>(img: &'a [u8], project: &str) -> Result<(&'a str, [u8; 32]), &'static str> {
     let read = |o: u32, b: &mut [u8]| match img.get(o as usize..o as usize + b.len()) {
         Some(s) => {
             b.copy_from_slice(s);
@@ -826,10 +998,29 @@ fn check(img: &[u8], query: &[u8]) -> Result<(Rollout, [u8; 32]), &'static str> 
     if digest[..] != img[at..] {
         return Err("the image is damaged: its SHA-256 doesn't match");
     }
-    let (version, project) = image::app_desc(img).ok_or("no app description")?;
-    if project != image::NODE_PROJECT {
-        return Err("that isn't node firmware");
+    let (version, p) = image::app_desc(img).ok_or("no app description")?;
+    if p != project {
+        return Err(if project == image::NODE_PROJECT {
+            "that isn't node firmware"
+        } else {
+            "that isn't gateway firmware"
+        });
     }
+    Ok((version, digest))
+}
+
+/// A node image to roll out, and which nodes `to` names.
+fn check(img: &[u8], ids: &[[u8; 6]]) -> Result<(Rollout, [u8; 32]), &'static str> {
+    let (version, digest) = check_image(img, image::NODE_PROJECT)?;
+    let fw = image::build_id(version, &digest);
+    Ok((
+        Rollout::new(fw, img.len() as u32, ids),
+        Sha256::digest(img).into(),
+    ))
+}
+
+/// The nodes `?to=` names: `all` for every node the page knows, or IDs.
+fn targets(query: &[u8]) -> Result<([[u8; 6]; web::MAX_NODES], usize), &'static str> {
     let mut b = [0u8; 128];
     let to = web::form_value(query, "to", &mut b).ok_or("say which nodes: ?to=all or ?to=id,id")?;
     let mut ids = [[0u8; 6]; web::MAX_NODES];
@@ -858,9 +1049,82 @@ fn check(img: &[u8], query: &[u8]) -> Result<(Rollout, [u8; 32]), &'static str> 
     if n == 0 {
         return Err("no nodes to update");
     }
-    let fw = image::build_id(version, &digest);
-    Ok((
-        Rollout::new(fw, img.len() as u32, &ids[..n]),
-        Sha256::digest(img).into(),
-    ))
+    Ok((ids, n))
+}
+
+/// Refuses an upload that can't be one before the image space, and any rollout in it, is touched.
+fn fits(len: usize) -> Result<(), &'static str> {
+    let room = IMAGE.lock(|i| i.borrow().buf.as_ref().map(|b| b.len()));
+    match room {
+        None => Err("another upload is running"),
+        Some(_) if len == 0 => Err("no image: send it as the body"),
+        Some(r) if len > r => Err("too big for the gateway's image space"),
+        Some(_) => Ok(()),
+    }
+}
+
+/// `POST /update/gateway`: gateway firmware as the raw body. Written to the other slot, checked
+/// there, and booted on trial after the response. Returns the response and whether to restart.
+async fn self_update(
+    sock: &mut TcpSocket<'_>,
+    early: &[u8],
+    len: usize,
+) -> (alloc::string::String, bool) {
+    if let Err(e) = fits(len) {
+        return (
+            text("400 Bad Request", &alloc::format!("Refused: {e}")),
+            false,
+        );
+    }
+    let Some(img) = IMAGE.lock(|i| {
+        let mut i = i.borrow_mut();
+        i.rollout = None; // the image space is shared with node rollouts
+        i.buf.take()
+    }) else {
+        return (text("409 Conflict", "Another upload is running."), false);
+    };
+    let res = match receive(sock, img, early, len).await {
+        Ok(()) => install(&img[..len]).await,
+        Err(e) => Err(e),
+    };
+    IMAGE.lock(|i| i.borrow_mut().buf = Some(img));
+    match res {
+        Ok(fw) => {
+            let fw = core::str::from_utf8(&fw).unwrap_or("?");
+            info!("gateway update {fw}: written, restarting");
+            let msg = alloc::format!(
+                "Wrote {fw}. Restarting into it once QuestDB has what the gateway holds."
+            );
+            (text("200 OK", &msg), true)
+        }
+        Err(e) => {
+            warn!("gateway update refused: {e}");
+            (
+                text("400 Bad Request", &alloc::format!("Refused: {e}")),
+                false,
+            )
+        }
+    }
+}
+
+/// Writes a gateway image to the slot we didn't boot from and points otadata at it. Returns its
+/// build ID.
+async fn install(img: &[u8]) -> Result<[u8; 12], &'static str> {
+    let (version, digest) = check_image(img, GATEWAY_PROJECT)?;
+    let slot = with_flash(flash::spare)
+        .flatten()
+        .ok_or("can't find the other app slot")?;
+    if img.len() as u32 > slot.len {
+        return Err("bigger than an app slot");
+    }
+    for (i, sector) in img.chunks(flash::SECTOR as usize).enumerate() {
+        let at = slot.offset + i as u32 * flash::SECTOR;
+        with_flash(|f| f.write(at, sector))
+            .and_then(|r| r.ok())
+            .ok_or("flash write")?;
+        Timer::after_millis(1).await; // let ESP-NOW and the network run between sectors
+    }
+    with_flash(|f| flash::verify(f, slot, GATEWAY_PROJECT)).ok_or("no flash")??;
+    with_flash(|f| flash::boot_next(f, slot)).ok_or("no flash")??;
+    Ok(image::build_id(version, &digest))
 }

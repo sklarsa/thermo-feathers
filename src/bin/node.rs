@@ -13,9 +13,6 @@
 
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;
-use esp_bootloader_esp_idf::partitions::{
-    self, PARTITION_TABLE_MAX_LEN, PartitionEntry, PartitionTable,
-};
 use esp_hal::{
     Blocking,
     clock::CpuClock,
@@ -33,9 +30,12 @@ use esp_radio::wifi::{ControllerConfig, WifiController};
 use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
+use thermo_feathers::image;
 use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, MAX_SAMPLES, NodeStatus, UPDATE};
 use thermo_feathers::*;
-use thermo_feathers::{image, otadata};
+
+#[path = "../flash.rs"]
+mod flash;
 
 // The project name is how the gateway and the node tell a node image from a gateway one.
 esp_bootloader_esp_idf::esp_app_desc!(
@@ -60,14 +60,18 @@ const UPDATE_CAP: Duration = Duration::from_secs(180);
 const CHUNK_WAIT: Duration = Duration::from_millis(100);
 /// Wakes to ignore update offers after an update fails, so a broken one can't drain the battery.
 const UPDATE_BACKOFF_WAKES: u16 = 60;
-const SECTOR: usize = 4096;
 const CRITICAL_V: f32 = 3.5; // no radio below this: its current spikes can brown the board out
 const FLASH_WINDOW: Duration = Duration::from_secs(30);
 const REPLY_WAIT: Duration = Duration::from_millis(50);
 const HELLO_WAIT: Duration = Duration::from_millis(30);
 const RADIO_CAP: Duration = Duration::from_secs(2);
 
-const MAGIC: u32 = 0x7EF0_0006; // bump the low half when State's layout changes
+/// Bump the low half when State's layout changes. A new MAGIC drops the buffered samples, at the
+/// update and again if it rolls back, and the image that rolls back sits out a flash window.
+const MAGIC: u32 = 0x7EF0_0007;
+/// Crashes in a row, without a reply from the gateway, before a confirmed image gives way to the
+/// one before it.
+const PANICS_TO_FALL_BACK: u8 = 3;
 
 /// Everything that survives deep sleep. Persistable: any bit pattern is valid.
 #[repr(C)]
@@ -96,6 +100,8 @@ struct State {
     fw: [u8; 12],
     /// Wakes left to ignore update offers.
     update_skip: u16,
+    /// Panics since the gateway last answered.
+    panics: u8,
     ring: SampleRing,
 }
 // SAFETY: integers, floats and arrays of them; SampleRing::fix repairs bad indexes.
@@ -117,6 +123,7 @@ fn custom_halt() -> ! {
         let st = &mut *core::ptr::addr_of_mut!(STATE);
         if st.magic == MAGIC {
             st.reset_reason = PANIC_REASON;
+            st.panics = st.panics.saturating_add(1);
         }
         let mut lp = LowPower::new(esp_hal::peripherals::LPWR::steal());
         lp.set_wakeup_deadline(
@@ -177,6 +184,14 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         info!("cold boot: {reset:?}, kept {} samples", st.ring.len());
     }
     st.ring.fix();
+    // A confirmed image that keeps crashing, before it can reach the gateway: the bootloader only
+    // rolls back unconfirmed ones, so go back by hand.
+    if st.panics >= PANICS_TO_FALL_BACK {
+        st.panics = 0;
+        if flash::fall_back(&mut flash) {
+            esp_hal::system::software_reset();
+        }
+    }
     // MAGIC is RTC memory's only guard: keep what drives sleep and the radio in range
     st.wake_s = st.wake_s.clamp(WAKE_MIN_S, WAKE_MAX_S);
     st.wakes_to_sweep = st
@@ -201,13 +216,10 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     }
     // After the flash window, so a crash in here can still be flashed over and watched. Every
     // boot: after a rollback, the old image wakes up with the new one's State.
-    st.fw = own_build_id(&mut flash);
+    st.fw = flash::build_id(&mut flash, FW);
     // A new image is on trial until its first reply from the gateway, in this boot: the
     // bootloader abandons it at the next wake otherwise. Only a cold boot can be the first.
-    let on_trial = cold
-        && read_otadata(&mut flash)
-            .and_then(|(_, e0, e1)| otadata::current(&e0, &e1))
-            .is_some_and(|c| c.2 == otadata::PENDING_VERIFY);
+    let on_trial = cold && flash::on_trial(&mut flash);
     info!(
         "fw {}{}",
         core::str::from_utf8(&st.fw).unwrap_or("?"),
@@ -258,8 +270,11 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             WifiController::new(peripherals.WIFI, ControllerConfig::default()).unwrap();
         let mut esp = controller.esp_now();
         let flags = radio(&mut esp, st, &rtc_us, woke_us).await;
+        if flags.is_some() {
+            st.panics = 0;
+        }
         if on_trial && flags.is_some() {
-            confirm(&mut flash);
+            flash::confirm(&mut flash);
         }
         st.update_skip = st.update_skip.saturating_sub(1);
         if flags.is_some_and(|f| f & UPDATE != 0) {
@@ -269,12 +284,14 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                     "update offered; {} wakes until we try again",
                     st.update_skip
                 );
-            } else if !charging && st.battery_pct < UPDATE_MIN_PCT {
+            } else if !charging && (st.battery_pct < UPDATE_MIN_PCT || st.battery_chip == 2) {
+                // the LC709203F is detected but not read: no charge level to go by
                 info!("update offered; waiting for charge or {UPDATE_MIN_PCT} %");
             } else {
+                // before, so a crash mid-update backs off too; a good update restarts anyway
+                st.update_skip = UPDATE_BACKOFF_WAKES;
                 let e = update(&mut esp, st, &mut flash).await;
                 error!("update failed: {e}");
-                st.update_skip = UPDATE_BACKOFF_WAKES;
             }
         }
     }
@@ -543,61 +560,6 @@ fn read_gauge(i2c: &mut I2c<'_, Blocking>, st: &mut State) {
     }
 }
 
-/// This image's build ID: its version and its own SHA-256, read from the slot it booted from.
-fn own_build_id(flash: &mut FlashStorage) -> [u8; 12] {
-    let digest = (|| {
-        let mut buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let pt = partitions::read_partition_table(flash, &mut buf).ok()?;
-        let mut region = pt.booted_partition().ok()??.as_flash_region(flash);
-        let max = region.capacity() as u32;
-        let at = image::digest_offset(|o, b| region.read(o, b).is_ok(), max)?;
-        let mut d = [0u8; 32];
-        region.read(at, &mut d).ok()?;
-        Some(d)
-    })();
-    if digest.is_none() {
-        warn!("can't read our own image's digest");
-    }
-    image::build_id(FW, &digest.unwrap_or_default())
-}
-
-/// Partition types and subtypes, as in partitions.csv.
-const APP: u8 = 0;
-const OTA_0: u8 = 0x10;
-const DATA: u8 = 1;
-const OTADATA: u8 = 0;
-
-/// By raw type and subtype: esp-bootloader-esp-idf's `find_partition` panics (`unreachable!`) on
-/// the first custom-type partition it passes, and partitions.csv starts with three (0x40).
-fn find(pt: &PartitionTable<'_>, ty: u8, sub: u8) -> Option<PartitionEntry> {
-    pt.iter()
-        .find(|p| p.raw_type() == ty && p.raw_subtype() == sub)
-}
-
-/// otadata's address and its two entries.
-fn read_otadata(flash: &mut FlashStorage) -> Option<(u32, [u8; 32], [u8; 32])> {
-    let mut buf = [0u8; PARTITION_TABLE_MAX_LEN];
-    let pt = partitions::read_partition_table(flash, &mut buf).ok()?;
-    let at = find(&pt, DATA, OTADATA)?.offset();
-    let (mut e0, mut e1) = ([0u8; 32], [0u8; 32]);
-    flash.read(at, &mut e0).ok()?;
-    flash.read(at + otadata::ENTRY_1, &mut e1).ok()?;
-    Some((at, e0, e1))
-}
-
-/// The gateway answered this image's first boot: keep it.
-fn confirm(flash: &mut FlashStorage) {
-    let done = read_otadata(flash).and_then(|(at, e0, e1)| {
-        let (which, seq, _) = otadata::current(&e0, &e1)?;
-        let e = otadata::entry(seq, otadata::VALID);
-        flash.write(at + which as u32 * otadata::ENTRY_1, &e).ok()
-    });
-    match done {
-        Some(()) => info!("update confirmed: this image stays"),
-        None => error!("couldn't mark this image valid; it rolls back at the next wake"),
-    }
-}
-
 /// Asks the gateway for the image from `offset`. One try.
 async fn fetch(esp: &mut EspNow, gw: &[u8; 6], offset: u32) -> Option<Frame> {
     let mut buf = [0u8; FRAME_MAX];
@@ -624,21 +586,12 @@ async fn fetch(esp: &mut EspNow, gw: &[u8; 6], offset: u32) -> Option<Frame> {
 /// it as New and restarts into it. Returns only if something went wrong, with what; the node
 /// then carries on with the image it has.
 async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &'static str {
-    let mut buf = [0u8; PARTITION_TABLE_MAX_LEN];
-    let Ok(pt) = partitions::read_partition_table(flash, &mut buf) else {
-        return "no partition table";
+    let Some(slot) = flash::spare(flash) else {
+        return "can't find the other app slot";
     };
-    let Some(booted) = pt.booted_partition().ok().flatten() else {
-        return "can't tell which slot we booted from";
-    };
-    let to = if booted.raw_subtype() == OTA_0 { 1 } else { 0 };
-    let Some(slot) = find(&pt, APP, OTA_0 + to as u8) else {
-        return "no OTA partitions";
-    };
-    info!("update: fetching into ota_{to}");
+    info!("update: fetching into ota_{}", slot.n);
 
-    let mut region = slot.as_flash_region(flash);
-    let cap = region.capacity();
+    const SECTOR: usize = flash::SECTOR as usize;
     let mut sector = [0xFFu8; SECTOR];
     let mut sha = Sha256::new();
     let mut want: Option<([u8; 32], u32)> = None;
@@ -665,7 +618,7 @@ async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &
         };
         misses = 0;
         match want {
-            None if (total as usize) < SECTOR || total as usize > cap => return "image size",
+            None if (total as usize) < SECTOR || total > slot.len => return "image size",
             None => want = Some((s, total)),
             Some(w) if w != (s, total) => return "the gateway's image changed",
             _ => {}
@@ -681,7 +634,7 @@ async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &
         offset += n as u32;
         if (offset as usize).is_multiple_of(SECTOR) || offset == total {
             let start = (offset - 1) / SECTOR as u32 * SECTOR as u32;
-            if region.write(start, &sector).is_err() {
+            if flash.write(slot.offset + start, &sector).is_err() {
                 return "flash write";
             }
             sector.fill(0xFF);
@@ -695,31 +648,18 @@ async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &
     if got != want_sha {
         return "SHA-256 doesn't match";
     }
-    let mut head = [0u8; image::DESC_END];
-    if region.read(0, &mut head).is_err()
-        || image::app_desc(&head).map(|d| d.1) != Some(image::NODE_PROJECT)
-    {
-        return "not a node image";
-    }
-    if image::digest_offset(|o, b| region.read(o, b).is_ok(), total).is_none() {
-        return "not an app image";
+    if let Err(e) = flash::verify(flash, slot, image::NODE_PROJECT) {
+        return e;
     }
     info!(
         "update: {total} bytes in {} s, SHA-256 ok",
         t0.elapsed().as_secs()
     );
 
-    let Some((at, e0, e1)) = read_otadata(flash) else {
-        return "otadata";
-    };
-    let (which, e) = otadata::switch_to(&e0, &e1, to);
-    if flash
-        .write(at + which as u32 * otadata::ENTRY_1, &e)
-        .is_err()
-    {
-        return "otadata write";
+    if let Err(e) = flash::boot_next(flash, slot) {
+        return e;
     }
-    info!("update: restarting into ota_{to}");
+    info!("update: restarting into ota_{}", slot.n);
     Timer::after_millis(50).await; // let the log out
     esp_hal::system::software_reset()
 }
