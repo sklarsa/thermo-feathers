@@ -9,8 +9,10 @@ same image.
 
 [SPEC.md](SPEC.md) is the spec; the
 [v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) explains the move to ESP-NOW.
-**Status:** v2 milestone 1 done (deep-sleep wakes proven: 841 in a row on 2026-11-10); the ESP-NOW
-link is built and waiting for its hardware test.
+**Status:** v2 milestones 1–3 done on one node. Milestone 1: 841 deep-sleep wakes in a row
+(2026-11-10). Milestone 2: node to gateway to QuestDB over ESP-NOW (2026-11-11). Milestone 3:
+gateway off for 60 min, then QuestDB off for 30 min (2026-11-11), with every reading stored
+once and none duplicated. More nodes come once they're assembled.
 
 ## Bill of materials
 
