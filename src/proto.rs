@@ -8,17 +8,25 @@ pub const VERSION: u8 = 1;
 /// ESP-NOW v1's payload limit.
 pub const FRAME_MAX: usize = 250;
 pub const MAX_SAMPLES: usize = 16;
+/// Firmware image bytes per `Chunk`: 32 fill a flash sector.
+pub const CHUNK: usize = 128;
+/// `Reply::flags`: stay awake and fetch the gateway's firmware image.
+pub const UPDATE: u8 = 1;
 
 const DISCOVER: u8 = 1;
 const HELLO: u8 = 2;
 const DATA: u8 = 3;
 const REPLY: u8 = 4;
+const FETCH: u8 = 5;
+const CHUNK_KIND: u8 = 6;
 
 const HEADER: usize = 3;
 const STATUS_LEN: usize = 48;
 const SAMPLE_LEN: usize = 9;
 const DATA_FIXED: usize = HEADER + 2 + STATUS_LEN + 1;
 const REPLY_LEN: usize = HEADER + 2 + 1 + 8 + 2 + 1;
+const FETCH_LEN: usize = HEADER + 4;
+const CHUNK_FIXED: usize = HEADER + 32 + 4 + 4 + 1;
 
 /// Everything a node reports about itself, once per frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -48,7 +56,7 @@ pub struct Reply {
     /// The gateway's epoch time; 0 until it has synced.
     pub epoch_us: i64,
     pub wake_s: u16,
-    /// Bit 0: stay awake for a firmware update (milestone 5). Nothing sets it yet.
+    /// `UPDATE`, or 0.
     pub flags: u8,
 }
 
@@ -72,6 +80,19 @@ pub enum Frame {
         samples: [Sample; MAX_SAMPLES],
     },
     Reply(Reply),
+    /// Node → gateway, during an update: "send the image from `offset`".
+    Fetch {
+        offset: u32,
+    },
+    /// Gateway → node: up to CHUNK bytes of the image at `offset`. Every chunk names the whole
+    /// image's SHA-256 and length, so a node notices if the image changes mid-transfer.
+    Chunk {
+        sha: [u8; 32],
+        total: u32,
+        offset: u32,
+        n: u8,
+        data: [u8; CHUNK],
+    },
 }
 
 struct W<'a> {
@@ -121,6 +142,8 @@ pub fn encode(f: &Frame, out: &mut [u8; FRAME_MAX]) -> usize {
         Frame::Hello { .. } => HELLO,
         Frame::Data { .. } => DATA,
         Frame::Reply(_) => REPLY,
+        Frame::Fetch { .. } => FETCH,
+        Frame::Chunk { .. } => CHUNK_KIND,
     };
     w.put(&[MAGIC, VERSION, kind]);
     match f {
@@ -158,6 +181,21 @@ pub fn encode(f: &Frame, out: &mut [u8; FRAME_MAX]) -> usize {
             w.put(&r.epoch_us.to_le_bytes());
             w.put(&r.wake_s.to_le_bytes());
             w.put(&[r.flags]);
+        }
+        Frame::Fetch { offset } => w.put(&offset.to_le_bytes()),
+        Frame::Chunk {
+            sha,
+            total,
+            offset,
+            n,
+            data,
+        } => {
+            let n = (*n as usize).min(CHUNK);
+            w.put(sha);
+            w.put(&total.to_le_bytes());
+            w.put(&offset.to_le_bytes());
+            w.put(&[n as u8]);
+            w.put(&data[..n]);
         }
     }
     w.n
@@ -214,6 +252,25 @@ pub fn decode(b: &[u8]) -> Option<Frame> {
             wake_s: r.u16(),
             flags: r.u8(),
         })),
+        FETCH if b.len() == FETCH_LEN => Some(Frame::Fetch { offset: r.u32() }),
+        CHUNK_KIND if b.len() >= CHUNK_FIXED => {
+            let sha = r.take();
+            let total = r.u32();
+            let offset = r.u32();
+            let n = r.u8();
+            if n as usize > CHUNK || b.len() != CHUNK_FIXED + n as usize {
+                return None;
+            }
+            let mut data = [0; CHUNK];
+            data[..n as usize].copy_from_slice(&r.b[..n as usize]);
+            Some(Frame::Chunk {
+                sha,
+                total,
+                offset,
+                n,
+                data,
+            })
+        }
         _ => None,
     }
 }
@@ -302,6 +359,46 @@ mod tests {
             let len = encode(&f, &mut b);
             assert_eq!(decode(&b[..len]), Some(f));
         }
+    }
+
+    #[test]
+    fn update_frames_round_trip() {
+        let mut b = [0; FRAME_MAX];
+        let mut data = [0; CHUNK];
+        data[..3].copy_from_slice(&[1, 2, 3]);
+        for f in [
+            Frame::Fetch { offset: 4096 },
+            Frame::Chunk {
+                sha: [7; 32],
+                total: 500_000,
+                offset: 4096,
+                n: 3,
+                data,
+            },
+            Frame::Chunk {
+                sha: [7; 32],
+                total: 500_000,
+                offset: 0,
+                n: CHUNK as u8,
+                data: [9; CHUNK],
+            },
+        ] {
+            let len = encode(&f, &mut b);
+            assert!(len <= FRAME_MAX);
+            assert_eq!(decode(&b[..len]), Some(f));
+        }
+        let len = encode(&Frame::Fetch { offset: 1 }, &mut b);
+        assert_eq!(decode(&b[..len - 1]), None);
+        let full = Frame::Chunk {
+            sha: [0; 32],
+            total: 1,
+            offset: 0,
+            n: 1,
+            data,
+        };
+        let len = encode(&full, &mut b);
+        b[len - 2] = 2; // claims a byte that isn't there
+        assert_eq!(decode(&b[..len]), None);
     }
 
     #[test]

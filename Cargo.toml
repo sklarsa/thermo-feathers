@@ -2,7 +2,7 @@
 edition      = "2024"
 name         = "thermo-feathers"
 rust-version = "1.95"
-version      = "0.3.0"
+version      = "0.4.0"
 license      = "MIT"
 
 [[bin]]
@@ -21,6 +21,7 @@ esp-backtrace          = { version = "0.20.0", features = ["esp32s3", "custom-ha
 esp-println            = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 esp-alloc              = { version = "0.11.0", features = ["esp32s3"] }
 esp-storage            = { version = "0.10.0", features = ["esp32s3"] }
+sha2                   = { version = "0.11", default-features = false }
 esp-radio              = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi", "esp-now"] }
 embassy-executor       = { version = "0.10.0", features = ["log"] }
 embassy-net            = { version = "0.9.1", features = ["dhcpv4", "dns", "log", "medium-ethernet", "tcp", "udp"] }

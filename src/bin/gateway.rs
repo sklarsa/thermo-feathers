@@ -36,15 +36,28 @@ use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use qwp_embedded::sender::{self, Buffers, SharedRing, Stats};
 use qwp_embedded::{Ring, Symbols};
+use sha2::{Digest, Sha256};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
-use thermo_feathers::proto::{self, FRAME_MAX, Frame, Reply};
-use thermo_feathers::web::{self, Nodes, SETTINGS_LEN, Seen, Settings};
+use thermo_feathers::image;
+use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, Reply, UPDATE};
+use thermo_feathers::web::{self, Nodes, Rollout, SETTINGS_LEN, Seen, Settings};
 use thermo_feathers::*;
 
 extern crate alloc;
 
-esp_bootloader_esp_idf::esp_app_desc!();
+// "thermo-gateway", so a node refuses this image if it's uploaded as node firmware.
+esp_bootloader_esp_idf::esp_app_desc!(
+    env!("CARGO_PKG_VERSION"),
+    "thermo-gateway",
+    esp_bootloader_esp_idf::BUILD_TIME,
+    esp_bootloader_esp_idf::BUILD_DATE,
+    esp_bootloader_esp_idf::ESP_IDF_COMPATIBLE_VERSION,
+    esp_bootloader_esp_idf::MMU_PAGE_SIZE,
+    0,
+    u16::MAX,
+    esp_bootloader_esp_idf::SECURE_VERSION
+);
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -79,6 +92,21 @@ static SYMBOLS: Symbols<128, 24> = Symbols::sized();
 static UI: BlockingMutex<CriticalSectionRawMutex, RefCell<(Settings, Nodes)>> =
     BlockingMutex::new(RefCell::new((Settings::DEFAULT, Nodes::EMPTY)));
 static QWP_STATS: Stats = Stats::new();
+
+/// Node firmware waiting in PSRAM, and which nodes are to get it. `buf` is out while an upload
+/// writes into it, and `rollout` is `None` then.
+struct Image {
+    buf: Option<&'static mut [u8]>,
+    /// SHA-256 of the whole upload, which every chunk names.
+    sha: [u8; 32],
+    rollout: Option<Rollout>,
+}
+static IMAGE: BlockingMutex<CriticalSectionRawMutex, RefCell<Image>> =
+    BlockingMutex::new(RefCell::new(Image {
+        buf: None,
+        sha: [0; 32],
+        rollout: None,
+    }));
 
 type Shared = &'static SharedRing<Rec>;
 
@@ -120,7 +148,9 @@ async fn main(spawner: Spawner) -> ! {
     let mem: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(ptr, size) };
     let (body, rest) = mem.split_at_mut(BODY_LEN);
     let (tcp_tx, rest) = rest.split_at_mut(TCP_TX_LEN);
-    let (ring_mem, _) = rest.split_at_mut(RING_BYTES);
+    let (ring_mem, image_mem) = rest.split_at_mut(RING_BYTES);
+    info!("node image space: {} KB", image_mem.len() / 1024);
+    IMAGE.lock(|i| i.borrow_mut().buf = Some(image_mem));
     // SAFETY: MaybeUninit<Rec> has no invalid bit patterns
     let (pre, slots, _) = unsafe { ring_mem.align_to_mut::<MaybeUninit<Rec>>() };
     assert!(pre.is_empty());
@@ -254,6 +284,14 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     )
                 });
                 UI.lock(|u| u.borrow_mut().1.heard(seen, &samples[..n as usize]));
+                let offer = IMAGE
+                    .lock(|i| {
+                        i.borrow_mut().rollout.as_mut().map(|r| {
+                            r.heard(&id, &fw_bytes);
+                            r.offer(&id)
+                        })
+                    })
+                    .unwrap_or(false);
                 if stored < n {
                     warn!("ring full: stored {stored}/{n} from {}", id_str(&id));
                 }
@@ -266,9 +304,46 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     stored,
                     epoch_us: if SYNCED.load(Relaxed) { now_us() } else { 0 },
                     wake_s: UI.lock(|u| u.borrow().0.wake_s),
-                    flags: 0,
+                    flags: if offer { UPDATE } else { 0 },
                 };
                 proto::encode(&Frame::Reply(reply), &mut buf)
+            }
+            Some(Frame::Fetch { offset }) => {
+                let id = device_id(&src);
+                let chunk = IMAGE.lock(|i| {
+                    let mut i = i.borrow_mut();
+                    let Image {
+                        buf: img,
+                        sha,
+                        rollout,
+                    } = &mut *i;
+                    let (img, r) = (img.as_ref()?, rollout.as_mut()?);
+                    if offset >= r.len || !r.fetch(&id, offset) {
+                        return None;
+                    }
+                    let n = (r.len - offset).min(CHUNK as u32) as usize;
+                    let mut data = [0u8; CHUNK];
+                    data[..n].copy_from_slice(&img[offset as usize..offset as usize + n]);
+                    Some((
+                        Frame::Chunk {
+                            sha: *sha,
+                            total: r.len,
+                            offset,
+                            n: n as u8,
+                            data,
+                        },
+                        offset as usize + n == r.len as usize,
+                    ))
+                });
+                let Some((chunk, last)) = chunk else {
+                    continue;
+                };
+                if offset == 0 {
+                    info!("{}: fetching the update", id_str(&id));
+                } else if last {
+                    info!("{}: fetched the update", id_str(&id));
+                }
+                proto::encode(&chunk, &mut buf)
             }
             _ => continue, // someone else's ESP-NOW, or ours from a newer version
         };
@@ -454,7 +529,18 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
         }
         let mut len = 0;
         let head = loop {
-            if let Some((post, path, at, body_len)) = web::parse_head(&req[..len]) {
+            if let Some(h) = web::parse_head(&req[..len]) {
+                if h.post && h.path == b"/update" {
+                    let (at, cl) = (h.len, h.content_length);
+                    let mut to = [0u8; 128];
+                    let q = h.query.len().min(to.len());
+                    to[..q].copy_from_slice(&h.query[..q]);
+                    let early = len.min(at + cl);
+                    let resp = upload(&mut sock, &req[at..early], cl, &to[..q]).await;
+                    write_all(&mut sock, resp.as_bytes()).await;
+                    break None;
+                }
+                let (post, path, at, body_len) = (h.post, h.path, h.len, h.content_length);
                 let route = match (post, path) {
                     (false, b"/") => Route::Home(None),
                     (false, b"/saved") => Route::Home(Some(Ok("Saved."))),
@@ -466,9 +552,12 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
                 };
                 break Some((route, at, at + body_len));
             }
+            if len == req.len() {
+                break None; // a head too big for us
+            }
             match sock.read(&mut req[len..]).await {
-                Ok(n) if n > 0 && len + n < req.len() => len += n,
-                _ => break None, // closed, timed out, or a head too big for us
+                Ok(n) if n > 0 => len += n,
+                _ => break None, // closed or timed out
             }
         };
         if let Some((route, at, end)) = head
@@ -482,13 +571,7 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
             }
             if len >= end {
                 let resp = respond(route, &req[at..end], ring, &mut flash);
-                let mut out = resp.as_bytes();
-                while !out.is_empty() {
-                    match sock.write(out).await {
-                        Ok(n) if n > 0 => out = &out[n..],
-                        _ => break,
-                    }
-                }
+                write_all(&mut sock, resp.as_bytes()).await;
             }
         }
         sock.close();
@@ -513,6 +596,7 @@ fn respond(
     use core::fmt::Write;
     let mut page = alloc::string::String::new();
     let (settings, nodes) = UI.lock(|u| *u.borrow());
+    let rollout = IMAGE.lock(|i| i.borrow().rollout);
     let gateway = || web::Gateway {
         up_s: Instant::now().as_secs(),
         channel: WIFI_CHANNEL.load(Relaxed),
@@ -522,11 +606,27 @@ fn respond(
         questdb: QUESTDB,
     };
     let _ = match route {
-        Route::Home(n) => web::render_home(&mut page, &settings, &nodes, &gateway(), n),
-        Route::Settings(n) => web::render_settings(&mut page, &settings, n),
+        Route::Home(n) => web::render_home(
+            &mut page,
+            &settings,
+            &nodes,
+            &gateway(),
+            rollout.as_ref(),
+            n,
+        ),
+        Route::Settings(n) => {
+            web::render_settings(&mut page, &settings, &nodes, rollout.as_ref(), n)
+        }
         Route::Rename => match rename(body, ring, flash) {
             Ok(()) => return see_other("/saved"),
-            Err(msg) => web::render_home(&mut page, &settings, &nodes, &gateway(), Some(Err(msg))),
+            Err(msg) => web::render_home(
+                &mut page,
+                &settings,
+                &nodes,
+                &gateway(),
+                rollout.as_ref(),
+                Some(Err(msg)),
+            ),
         },
         Route::Save => {
             let mut b = [0u8; 8];
@@ -622,4 +722,145 @@ fn save(flash: &mut FlashStorage, s: &Settings) {
     if let Err(e) = flash.write(SETTINGS_ADDR, &s.to_bytes()) {
         error!("settings: flash write failed: {e:?}");
     }
+}
+
+async fn write_all(sock: &mut TcpSocket<'_>, mut out: &[u8]) {
+    while !out.is_empty() {
+        match sock.write(out).await {
+            Ok(n) if n > 0 => out = &out[n..],
+            _ => break,
+        }
+    }
+}
+
+fn text(status: &str, body: &str) -> alloc::string::String {
+    alloc::format!(
+        "HTTP/1.0 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `POST /update?to=all|id,id`: node firmware as the raw body, from espflash save-image. Checked
+/// whole before any node is offered it.
+async fn upload(
+    sock: &mut TcpSocket<'_>,
+    early: &[u8],
+    len: usize,
+    query: &[u8],
+) -> alloc::string::String {
+    let Some(img) = IMAGE.lock(|i| {
+        let mut i = i.borrow_mut();
+        i.rollout = None;
+        i.buf.take()
+    }) else {
+        return text("409 Conflict", "Another upload is running.");
+    };
+    let res = receive(sock, img, early, len)
+        .await
+        .and_then(|()| check(&img[..len], query));
+    let msg = match &res {
+        Ok((r, _)) => {
+            let n = r.targets.iter().flatten().count();
+            let fw = core::str::from_utf8(&r.fw).unwrap_or("?");
+            info!("update {fw}: {len} bytes for {n} nodes");
+            alloc::format!("Got {fw}. {n} node(s) will fetch it at their next wake.")
+        }
+        Err(e) => {
+            warn!("update refused: {e}");
+            alloc::format!("Refused: {e}")
+        }
+    };
+    IMAGE.lock(|i| {
+        let mut i = i.borrow_mut();
+        i.buf = Some(img);
+        if let Ok((r, sha)) = res {
+            i.rollout = Some(r);
+            i.sha = sha;
+        }
+    });
+    text(
+        if res.is_ok() {
+            "200 OK"
+        } else {
+            "400 Bad Request"
+        },
+        &msg,
+    )
+}
+
+async fn receive(
+    sock: &mut TcpSocket<'_>,
+    img: &mut [u8],
+    early: &[u8],
+    len: usize,
+) -> Result<(), &'static str> {
+    if len > img.len() {
+        return Err("too big for the gateway's image space");
+    }
+    img[..early.len()].copy_from_slice(early);
+    let mut got = early.len();
+    while got < len {
+        match sock.read(&mut img[got..len]).await {
+            Ok(n) if n > 0 => got += n,
+            _ => return Err("the upload was cut short"),
+        }
+    }
+    Ok(())
+}
+
+/// A whole, intact node image, and which nodes `to` names.
+fn check(img: &[u8], query: &[u8]) -> Result<(Rollout, [u8; 32]), &'static str> {
+    let read = |o: u32, b: &mut [u8]| match img.get(o as usize..o as usize + b.len()) {
+        Some(s) => {
+            b.copy_from_slice(s);
+            true
+        }
+        None => false,
+    };
+    let at = image::digest_offset(read, img.len() as u32).ok_or("not an ESP app image")? as usize;
+    if at + 32 != img.len() {
+        return Err("bytes after the image's end");
+    }
+    let digest: [u8; 32] = Sha256::digest(&img[..at]).into();
+    if digest[..] != img[at..] {
+        return Err("the image is damaged: its SHA-256 doesn't match");
+    }
+    let (version, project) = image::app_desc(img).ok_or("no app description")?;
+    if project != image::NODE_PROJECT {
+        return Err("that isn't node firmware");
+    }
+    let mut b = [0u8; 128];
+    let to = web::form_value(query, "to", &mut b).ok_or("say which nodes: ?to=all or ?to=id,id")?;
+    let mut ids = [[0u8; 6]; web::MAX_NODES];
+    let mut n = 0;
+    if to == "all" {
+        let (settings, nodes) = UI.lock(|u| *u.borrow());
+        let (known, k) = web::known_ids(&settings, &nodes);
+        for id in &known[..k.min(web::MAX_NODES)] {
+            ids[n] = *id;
+            n += 1;
+        }
+    } else {
+        for id in to.split(',').filter(|i| !i.is_empty()) {
+            if n == web::MAX_NODES {
+                break;
+            }
+            ids[n] = id
+                .as_bytes()
+                .try_into()
+                .ok()
+                .filter(|i: &[u8; 6]| i.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .ok_or("node IDs are 6 lowercase hex digits")?;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Err("no nodes to update");
+    }
+    let fw = image::build_id(version, &digest);
+    Ok((
+        Rollout::new(fw, img.len() as u32, &ids[..n]),
+        Sha256::digest(img).into(),
+    ))
 }

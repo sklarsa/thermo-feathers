@@ -3,6 +3,7 @@
 
 use core::fmt::{self, Write};
 
+use crate::proto::CHUNK;
 use crate::{CHARGING, Sample, WAKE_MAX_S, WAKE_MIN_S, crc8};
 
 /// Nodes the page tracks and names it keeps. The design has room for 4.
@@ -168,6 +169,115 @@ impl Nodes {
     }
 }
 
+/// Where one node's update stands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Progress {
+    /// Offered in the node's next reply.
+    Waiting,
+    /// Fetching; the last offset it asked for.
+    Sending(u32),
+    /// Fetched the last chunk: it should come back on the new build.
+    Sent,
+    Done,
+    /// Came back on its old build: the update didn't take, or rolled back. Not offered again.
+    Failed,
+}
+
+/// The firmware image the gateway holds, and which nodes are to get it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rollout {
+    /// The image's build ID, as the node will report it.
+    pub fw: [u8; 12],
+    pub len: u32,
+    pub targets: [Option<([u8; 6], Progress)>; MAX_NODES],
+}
+
+impl Rollout {
+    pub fn new(fw: [u8; 12], len: u32, ids: &[[u8; 6]]) -> Self {
+        let mut targets = [None; MAX_NODES];
+        for (t, id) in targets.iter_mut().zip(ids) {
+            *t = Some((*id, Progress::Waiting));
+        }
+        Self { fw, len, targets }
+    }
+
+    pub fn progress(&self, id: &[u8; 6]) -> Option<Progress> {
+        self.targets
+            .iter()
+            .flatten()
+            .find(|t| t.0 == *id)
+            .map(|t| t.1)
+    }
+
+    fn get(&mut self, id: &[u8; 6]) -> Option<&mut Progress> {
+        self.targets
+            .iter_mut()
+            .flatten()
+            .find(|t| t.0 == *id)
+            .map(|t| &mut t.1)
+    }
+
+    /// Whether `id`'s next reply asks it to fetch the image.
+    pub fn offer(&self, id: &[u8; 6]) -> bool {
+        matches!(
+            self.progress(id),
+            Some(Progress::Waiting | Progress::Sending(_))
+        )
+    }
+
+    /// A Data frame from `id`, which runs build `fw`.
+    pub fn heard(&mut self, id: &[u8; 6], fw: &[u8; 12]) {
+        let new = self.fw;
+        if let Some(p) = self.get(id) {
+            if *fw == new {
+                *p = Progress::Done;
+            } else if *p == Progress::Sent {
+                *p = Progress::Failed;
+            }
+        }
+    }
+
+    /// `id` asks for the image at `offset`: whether to answer.
+    pub fn fetch(&mut self, id: &[u8; 6], offset: u32) -> bool {
+        let len = self.len;
+        match self.get(id) {
+            Some(p @ (Progress::Waiting | Progress::Sending(_) | Progress::Sent)) => {
+                *p = if offset as usize + CHUNK >= len as usize {
+                    Progress::Sent
+                } else {
+                    Progress::Sending(offset)
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Progress::Waiting => f.write_str("update waiting for its next wake"),
+            Progress::Sending(_) => f.write_str("updating"),
+            Progress::Sent => f.write_str("restarting into the update"),
+            Progress::Done => f.write_str("updated"),
+            Progress::Failed => f.write_str("<span class=bad>update rolled back</span>"),
+        }
+    }
+}
+
+/// A node's line about the rollout, if it's in one.
+fn rollout_line(w: &mut impl Write, r: Option<&Rollout>, id: &[u8; 6]) -> fmt::Result {
+    let Some((r, p)) = r.and_then(|r| r.progress(id).map(|p| (r, p))) else {
+        return Ok(());
+    };
+    write!(w, "<br>{p}")?;
+    if let Progress::Sending(o) = p {
+        write!(w, " {}%", o as u64 * 100 / r.len.max(1) as u64)?;
+    }
+    write!(w, " · {}", Esc(fw_str(&r.fw)))
+}
+
 /// The gateway's own state, for the page's footer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gateway {
@@ -246,6 +356,7 @@ button{cursor:pointer;background:var(--fg);color:var(--bg);border-color:var(--fg
 .rename{display:flex;gap:8px;margin:8px 0 4px}.rename input{flex:1;min-width:0}
 .stack label{display:flex;flex-direction:column;gap:4px;margin-bottom:16px;font-weight:600}
 .stack small{color:var(--dim);font-weight:400}.stack button{width:100%}
+.stack .check{flex-direction:row;align-items:baseline;font-weight:400;gap:8px}
 </style></head><body><main>"#;
 
 /// Drops `/saved` from the address bar, so a reload doesn't say "Saved." again.
@@ -257,6 +368,14 @@ const REFRESH: &str = "<script>setInterval(async()=>{if(document.hidden||\
 document.querySelector('details[open]'))return;try{const t=await(await fetch('/')).text();\
 const n=new DOMParser().parseFromString(t,'text/html').getElementById('rooms');\
 if(n)document.getElementById('rooms').replaceWith(n)}catch(e){}},30000)</script>";
+
+/// Sends the chosen file as the raw body of `POST /update?to=<ids>`.
+const UPLOAD: &str = "<script>up.onsubmit=async e=>{e.preventDefault();\
+const to=[...up.querySelectorAll('[name=to]:checked')].map(c=>c.value).join(',');\
+if(!to){upmsg.textContent='Pick at least one node.';return}upmsg.textContent='Uploading…';\
+try{const r=await fetch('/update?to='+to,{method:'POST',body:img.files[0]});\
+upmsg.textContent=await r.text();if(r.ok)setTimeout(()=>location.reload(),1500)}\
+catch(e){upmsg.textContent='Upload failed: '+e}}</script>";
 
 /// A line above the page: what was just saved, or why it wasn't.
 pub type Note<'a> = Option<Result<&'a str, &'a str>>;
@@ -293,12 +412,23 @@ fn rows(s: &Settings, nodes: &Nodes) -> ([Row; 2 * MAX_NODES], usize) {
     (out, n)
 }
 
+/// IDs of every node the page knows: heard from since boot, or named.
+pub fn known_ids(s: &Settings, nodes: &Nodes) -> ([[u8; 6]; 2 * MAX_NODES], usize) {
+    let (rows, n) = rows(s, nodes);
+    let mut ids = [[0u8; 6]; 2 * MAX_NODES];
+    for (i, r) in rows[..n].iter().enumerate() {
+        ids[i] = r.0;
+    }
+    (ids, n)
+}
+
 /// The room view: one card per node, temperature first. Tapping a name opens its rename box.
 pub fn render_home(
     w: &mut impl Write,
     s: &Settings,
     nodes: &Nodes,
     g: &Gateway,
+    rollout: Option<&Rollout>,
     n: Note,
 ) -> fmt::Result {
     w.write_str(HEAD)?;
@@ -368,12 +498,9 @@ pub fn render_home(
         if named.is_some() {
             write!(w, "{} · ", id_str(id))?;
         }
-        write!(
-            w,
-            "fw {} · {} dBm</div></section>",
-            Esc(fw_str(&x.fw)),
-            x.rssi
-        )?;
+        write!(w, "fw {} · {} dBm", Esc(fw_str(&x.fw)), x.rssi)?;
+        rollout_line(w, rollout, id)?;
+        w.write_str("</div></section>")?;
     }
     w.write_str("<footer>Gateway: ")?;
     match g.channel {
@@ -407,7 +534,13 @@ pub fn render_home(
 }
 
 /// Unit and wake interval. Names are set on the room cards, next to their readings.
-pub fn render_settings(w: &mut impl Write, s: &Settings, n: Note) -> fmt::Result {
+pub fn render_settings(
+    w: &mut impl Write,
+    s: &Settings,
+    nodes: &Nodes,
+    rollout: Option<&Rollout>,
+    n: Note,
+) -> fmt::Result {
     w.write_str(HEAD)?;
     w.write_str("<title>Settings</title>")?;
     w.write_str(STYLE)?;
@@ -430,13 +563,44 @@ pub fn render_settings(w: &mut impl Write, s: &Settings, n: Note) -> fmt::Result
         "<p class=sub>To rename a room, tap its name on the Rooms page. Each rename is also a \
          row in QuestDB's device_locations.</p>",
     )?;
+    w.write_str(
+        "<h1>Node firmware</h1><form class=stack id=up><label>Image (.bin from espflash \
+         save-image)<input type=file id=img accept=.bin required></label>",
+    )?;
+    let (rows, n) = rows(s, nodes);
+    for (id, _) in &rows[..n] {
+        write!(
+            w,
+            "<label class=check><input type=checkbox name=to value={} checked><span>{}",
+            id_str(id),
+            Esc(s.name(id).unwrap_or(id_str(id)))
+        )?;
+        rollout_line(w, rollout, id)?;
+        w.write_str("</span></label>")?;
+    }
+    w.write_str(
+        "<button>Upload</button><small id=upmsg></small></form><p class=sub>Each node fetches it \
+         at its next wake if charging or above 40 % battery, restarts into it, and goes back to its \
+         old firmware if the new one doesn't reach the gateway on its first try.</p>",
+    )?;
+    w.write_str(UPLOAD)?;
     w.write_str(UNSAVE)?;
     w.write_str("</main></body></html>")
 }
 
-/// A request's head, once `buf` holds all of it: (is POST, path without the query, head length,
-/// Content-Length). `None` until the blank line arrives, or if the request line is malformed.
-pub fn parse_head(buf: &[u8]) -> Option<(bool, &[u8], usize, usize)> {
+/// A request's head, once `buf` holds all of it.
+pub struct Head<'a> {
+    pub post: bool,
+    pub path: &'a [u8],
+    /// After the `?`; empty without one.
+    pub query: &'a [u8],
+    /// Where the body starts in `buf`.
+    pub len: usize,
+    pub content_length: usize,
+}
+
+/// `None` until the blank line after the headers arrives, or if the request line is malformed.
+pub fn parse_head(buf: &[u8]) -> Option<Head<'_>> {
     let end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let mut lines = buf[..end].split(|&b| b == b'\n');
     let mut first = lines.next()?.split(|&b| b == b' ');
@@ -445,8 +609,11 @@ pub fn parse_head(buf: &[u8]) -> Option<(bool, &[u8], usize, usize)> {
         b"POST" => true,
         _ => return None,
     };
-    let path = first.next()?;
-    let path = path.split(|&b| b == b'?').next()?;
+    let target = first.next()?;
+    let (path, query) = match target.iter().position(|&b| b == b'?') {
+        Some(i) => (&target[..i], &target[i + 1..]),
+        None => (target, &[][..]),
+    };
     let mut len = 0;
     for l in lines {
         if let Some(i) = l.iter().position(|&b| b == b':')
@@ -459,7 +626,13 @@ pub fn parse_head(buf: &[u8]) -> Option<(bool, &[u8], usize, usize)> {
                 .ok()?;
         }
     }
-    Some((post, path, end, len))
+    Some(Head {
+        post,
+        path,
+        query,
+        len: end,
+        content_length: len,
+    })
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -587,7 +760,10 @@ mod tests {
             ..Default::default()
         };
         let mut h = String::new();
-        render_home(&mut h, &s, &n, &g, Some(Ok("Saved."))).unwrap();
+        let mut ro = Rollout::new(*b"0.4.0-abcdef", 1000, &[*b"aaaaaa"]);
+        ro.fetch(b"aaaaaa", 500);
+        render_home(&mut h, &s, &n, &g, Some(&ro), Some(Ok("Saved."))).unwrap();
+        assert!(h.contains("updating 50% · 0.4.0-abcdef"));
         assert!(h.contains("class=note>Saved."));
         assert!(h.contains("&lt;b&gt;Kid&#39;s room&lt;/b&gt;") && !h.contains("<b>Kid"));
         assert!(h.contains("68.0°F") && h.contains("class=bad>battery 7%"));
@@ -598,16 +774,51 @@ mod tests {
         assert!(h.contains("value=bbbbbb") && h.contains("value=\"Attic\""));
         assert!(h.contains("<summary>bbbbbb</summary>")); // unnamed: the ID is the name
         let mut h = String::new();
-        render_settings(&mut h, &s, Some(Err("nope"))).unwrap();
+        render_settings(&mut h, &s, &n, None, Some(Err("nope"))).unwrap();
+        assert!(h.contains("name=to value=bbbbbb checked"));
         assert!(h.contains("class='note bad'>nope") && h.contains("value=60"));
+    }
+
+    #[test]
+    fn rollout_follows_each_node() {
+        let (a, b, c) = (*b"aaaaaa", *b"bbbbbb", *b"cccccc");
+        let new = *b"0.4.0-abcdef";
+        let old = *b"0.3.0-123456";
+        let mut r = Rollout::new(new, 300, &[a, b]);
+        assert!(r.offer(&a) && r.offer(&b) && !r.offer(&c));
+        assert!(!r.fetch(&c, 0)); // not a target
+        assert!(r.fetch(&a, 0));
+        assert_eq!(r.progress(&a), Some(Progress::Sending(0)));
+        assert!(r.fetch(&a, 256)); // the last chunk
+        assert_eq!(r.progress(&a), Some(Progress::Sent));
+        assert!(!r.offer(&a));
+        assert!(r.fetch(&a, 256)); // its answer got lost: asked again
+        r.heard(&a, &new);
+        assert_eq!(r.progress(&a), Some(Progress::Done));
+        // b gets it all but comes back on its old build: rolled back, and left alone
+        r.fetch(&b, 256);
+        r.heard(&b, &old);
+        assert_eq!(r.progress(&b), Some(Progress::Failed));
+        assert!(!r.offer(&b) && !r.fetch(&b, 0));
+        // a node already on the build is done without fetching
+        let mut r = Rollout::new(new, 300, &[a]);
+        r.heard(&a, &new);
+        assert_eq!(r.progress(&a), Some(Progress::Done));
+        // one still waiting that reports its old build keeps waiting
+        let mut r = Rollout::new(new, 300, &[a]);
+        r.heard(&a, &old);
+        assert!(r.offer(&a));
     }
 
     #[test]
     fn parses_requests_and_forms() {
         let r = b"POST /name?x=1 HTTP/1.1\r\nHost: g\r\ncontent-length: 7\r\n\r\nid=abc";
-        assert_eq!(parse_head(r), Some((true, &b"/name"[..], r.len() - 6, 7)));
-        assert_eq!(parse_head(b"GET / HTTP/1.1\r\nHost: g\r\n"), None); // not all there yet
-        assert_eq!(parse_head(b"BREW / HTTP/1.1\r\n\r\n"), None);
+        let h = parse_head(r).unwrap();
+        assert!(h.post && h.path == b"/name" && h.query == b"x=1");
+        assert_eq!((h.len, h.content_length), (r.len() - 6, 7));
+        assert!(parse_head(b"GET / HTTP/1.1\r\nHost: g\r\n").is_none()); // not all there yet
+        assert!(parse_head(b"BREW / HTTP/1.1\r\n\r\n").is_none());
+        assert_eq!(parse_head(b"GET /a HTTP/1.1\r\n\r\n").unwrap().query, b"");
         let mut out = [0; 32];
         let body = b"id=610338&name=Kid%27s+room%20%E2%9C%93&bad=%zz";
         assert_eq!(form_value(body, "name", &mut out), Some("Kid's room ✓"));

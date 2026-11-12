@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "thermo-feathers"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
@@ -1959,6 +1959,7 @@ dependencies = [
  "esp-storage",
  "log",
  "qwp-embedded",
+ "sha2",
  "sntpc",
  "sntpc-net-embassy",
  "static_cell",

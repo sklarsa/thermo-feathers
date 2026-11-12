@@ -9,10 +9,12 @@ same image.
 
 [SPEC.md](SPEC.md) is the spec; the
 [v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) explains the move to ESP-NOW.
-**Status:** v2 milestones 1–3 done on one node. Milestone 1: 841 deep-sleep wakes in a row
+**Status:** v2 milestones 1–5 done on one node. Milestone 1: 841 deep-sleep wakes in a row
 (2026-11-10). Milestone 2: node to gateway to QuestDB over ESP-NOW (2026-11-11). Milestone 3:
 gateway off for 60 min, then QuestDB off for 30 min (2026-11-11), with every reading stored
-once and none duplicated. More nodes come once they're assembled.
+once and none duplicated. Milestone 4: the gateway's web page (2026-11-12). Milestone 5: nodes
+update over ESP-NOW and roll back an image that fails (2026-11-12). More nodes come once they're
+assembled.
 
 ## Bill of materials
 
@@ -33,13 +35,27 @@ The enclosure isn't designed yet. Pins and power rules are in [SPEC.md](SPEC.md#
 Same toolchain as s3-sensors: `espup install --targets esp32s3`, source `~/export-esp.sh`, then
 
 ```sh
-cargo run --release --bin node   # espflash flashes with partitions.csv and opens the monitor
+scripts/flash-node.sh   # Linux: builds, then flashes the next board to show up on USB
 ```
 
-A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off):
-tap RESET, then run the command. Or let `scripts/flash-node.sh` (Linux) wait for it: it builds,
-then flashes whichever board shows up on USB next, so press RESET whenever it's ready. The
-gateway, already plugged in, never shows up anew, so it's never picked.
+A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off), so
+the script waits for one to show up: press RESET whenever it's ready. The gateway, already plugged
+in, never shows up anew, so it's never picked. The script also flashes `bootloader/bootloader.bin`,
+ESP-IDF's bootloader with app rollback turned on (`bootloader/build.sh` rebuilds it with Docker).
+espflash's own bootloader can't roll back, so a node needs this one USB flash before it can be
+updated over the air.
+
+After that, update nodes through the gateway:
+
+```sh
+scripts/ota.sh <gateway address> [all | id,id]   # build, then hand the image to the gateway
+```
+
+or upload the `.bin` from `espflash save-image` on the gateway's Settings page. Each node fetches it
+at its next wake (if charging, or above 40 % battery), restarts into it, and keeps it once it hears
+from the gateway. If the new image never gets that far, the bootloader goes back to the old one at
+the next wake, and the gateway's page says the update rolled back. A node reports its build as
+`<version>-<6 hex>`, from the image's own SHA-256, so every build is told apart.
 
 The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's
 the only device on WiFi, so it's the only build that needs credentials:
@@ -57,7 +73,7 @@ sets the nodes' wake interval. Those settings live in the gateway's flash.
 
 ## Host tests
 
-The logic in `src/lib.rs`, `src/proto.rs` and `src/web.rs` runs on the host against a checkout of qwp-embedded next to this repo:
+The logic in `src/lib.rs` and its modules runs on the host against a checkout of qwp-embedded next to this repo:
 
 ```sh
 rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib

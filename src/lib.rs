@@ -3,6 +3,8 @@
 
 pub use qwp_embedded as qwp;
 
+pub mod image;
+pub mod otadata;
 pub mod proto;
 pub mod web;
 
