@@ -35,8 +35,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const FW: &str = env!("CARGO_PKG_VERSION");
 
 const WAKE_S: u16 = 60; // until the gateway says otherwise
-const WAKE_MIN_S: u16 = 10; // what a reply's wake interval is clamped to
-const WAKE_MAX_S: u16 = 3600;
 const CRITICAL_WAKE_S: u32 = 600;
 const LOW_PCT: f32 = 10.0; // the interval doubles below this
 const CRITICAL_V: f32 = 3.5; // no radio below this: its current spikes can brown the board out
@@ -45,7 +43,7 @@ const REPLY_WAIT: Duration = Duration::from_millis(50);
 const HELLO_WAIT: Duration = Duration::from_millis(30);
 const RADIO_CAP: Duration = Duration::from_secs(2);
 
-const MAGIC: u32 = 0x7EF0_0004; // bump the low half when State's layout changes
+const MAGIC: u32 = 0x7EF0_0005; // bump the low half when State's layout changes
 
 /// Everything that survives deep sleep. Persistable: any bit pattern is valid.
 #[repr(C)]
@@ -122,10 +120,24 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     };
     let woke_us = rtc_us();
     if cold {
+        // A reset that didn't lose power (watchdog, software, USB) leaves RTC memory as it was:
+        // keep the samples that have epoch time. Power-on can also mean a brownout, so not then.
+        use SocResetReason::*;
+        let keep = st.magic == MAGIC
+            && reset.is_some_and(|r| {
+                !matches!(r, ChipPowerOn | SysBrownOut | CorePwrGlitch | SysClkGlitch)
+            });
+        // SAFETY: SampleRing is plain data; this copy is moved back below or dropped
+        let ring = keep.then(|| unsafe { core::ptr::read(&st.ring) });
         // ponytail: magic + wake cause, no CRC; a garbled header after a brownout is caught by
         // the reset reason, and SampleRing::fix guards the indexes either way
         // SAFETY: State is valid zeroed
         *st = unsafe { core::mem::zeroed() };
+        if let Some(r) = ring {
+            st.ring = r;
+            st.ring.fix();
+            st.ring.retain_sendable();
+        }
         st.magic = MAGIC;
         st.cal_ref = cal_ref;
         st.next_wake_rtc_us = woke_us;
@@ -133,9 +145,17 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         st.battery_pct = f32::NAN;
         st.charge_rate = f32::NAN;
         st.wake_s = WAKE_S;
-        info!("cold boot: {reset:?}");
+        info!("cold boot: {reset:?}, kept {} samples", st.ring.len());
     }
     st.ring.fix();
+    // MAGIC is RTC memory's only guard: keep what drives sleep and the radio in range
+    st.wake_s = st.wake_s.clamp(WAKE_MIN_S, WAKE_MAX_S);
+    st.wakes_to_sweep = st
+        .wakes_to_sweep
+        .min(sweep_skips(u32::MAX, st.wake_s as u32));
+    if !(1..=13).contains(&st.gw_channel) {
+        st.gw_channel = 0;
+    }
     st.boot_count += 1;
     if reset != Some(SocResetReason::CoreDeepSleep) {
         st.reset_reason = reset.map_or(0, |r| r as u32);

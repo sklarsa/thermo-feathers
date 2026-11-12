@@ -8,8 +8,8 @@
 
 //! Feather ESP32-S3 gateway, on wall power. A WiFi station that also listens on ESP-NOW: nodes'
 //! frames go into a PSRAM ring, which qwp-embedded streams to QuestDB. Each frame is acked to its
-//! node once it's in the ring, with the time and the wake interval. See
-//! docs/superpowers/specs/2026-11-10-espnow-gateway-design.md.
+//! node once it's in the ring, with the time and the wake interval. Serves the web page on port 80.
+//! See docs/superpowers/specs/2026-11-10-espnow-gateway-design.md.
 
 use core::cell::{Cell, RefCell};
 use core::mem::MaybeUninit;
@@ -20,9 +20,10 @@ use embassy_executor::Spawner;
 use embassy_net::{
     Runner, Stack, StackResources,
     dns::DnsQueryType,
+    tcp::TcpSocket,
     udp::{PacketMetadata, UdpSocket},
 };
-use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::{clock::CpuClock, psram::Psram, rng::Rng, timer::timg::TimerGroup};
@@ -31,13 +32,17 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ControllerConfig, Interface, PowerSaveMode, WifiController,
     sta::StationConfig,
 };
+use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use qwp_embedded::sender::{self, Buffers, SharedRing, Stats};
 use qwp_embedded::{Ring, Symbols};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 use thermo_feathers::proto::{self, FRAME_MAX, Frame, Reply};
+use thermo_feathers::web::{self, Nodes, SETTINGS_LEN, Seen, Settings};
 use thermo_feathers::*;
+
+extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -55,8 +60,8 @@ const PASSWORD: &str = env!("WIFI_PASSWORD");
 const QUESTDB: &str = env!("QUESTDB_ADDR"); // ip:port of QuestDB's HTTP endpoint, e.g. 192.168.1.10:9000
 const NTP_SERVER: &str = "pool.ntp.org";
 
-/// Sent to every node in every reply. ponytail: fixed until the web page sets it (milestone 4).
-const WAKE_S: u16 = 60;
+/// partitions.csv's `settings` partition: names, unit and wake interval.
+const SETTINGS_ADDR: u32 = 0xA000;
 
 const BODY_LEN: usize = 32 * 1024;
 const TCP_TX_LEN: usize = 32 * 1024;
@@ -68,7 +73,11 @@ const RING_BYTES: usize = 1024 * 1024;
 static OFFSET_US: critical_section::Mutex<Cell<i64>> = critical_section::Mutex::new(Cell::new(0));
 static SYNCED: AtomicBool = AtomicBool::new(false);
 static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
-static SYMBOLS: Symbols = Symbols::new();
+/// Device IDs, firmware versions and room names. Append-only until a reboot.
+static SYMBOLS: Symbols<128, 24> = Symbols::sized();
+/// The web page's settings, and what each node last sent.
+static UI: BlockingMutex<CriticalSectionRawMutex, RefCell<(Settings, Nodes)>> =
+    BlockingMutex::new(RefCell::new((Settings::DEFAULT, Nodes::EMPTY)));
 static QWP_STATS: Stats = Stats::new();
 
 type Shared = &'static SharedRing<Rec>;
@@ -90,6 +99,17 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    let mut b = [0u8; SETTINGS_LEN];
+    match flash
+        .read(SETTINGS_ADDR, &mut b)
+        .ok()
+        .and_then(|_| Settings::from_bytes(&b))
+    {
+        Some(s) => UI.lock(|u| u.borrow_mut().0 = s),
+        None => info!("settings: none saved, using defaults"),
+    }
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
@@ -131,7 +151,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         Interface::station(),
         embassy_net::Config::dhcpv4(Default::default()),
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
         seed,
     );
 
@@ -152,6 +172,7 @@ async fn main(spawner: Spawner) -> ! {
         .unwrap(),
     );
     spawner.spawn(report(stack, ring).unwrap());
+    spawner.spawn(http(stack, ring, flash).unwrap());
 
     espnow(esp, ring).await
 }
@@ -186,16 +207,19 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     continue;
                 };
                 // A full table only costs a new version its name, never the node its data
-                let fw = SYMBOLS.intern(fw).unwrap_or_else(|| {
+                let fw = intern_spare(fw).unwrap_or_else(|| {
                     warn!("symbol table full: {} fw {fw} logged as ?", id_str(&id));
                     fw_unknown
                 });
                 // The node's time at wake: the same in every frame and retry of a wake, so
-                // QuestDB's dedup keeps one row. A node without time yet gets none.
+                // QuestDB's dedup keeps one row. A node without time yet gets none, and neither
+                // does a wild one: QuestDB would reject the batch, and other nodes' rows with it.
                 let t_us = status.t_us;
+                let t_ok = (EPOCH_MIN_US..EPOCH_MAX_US).contains(&t_us);
                 let rssi = r.info.rx_control.rssi;
                 let channel = r.info.rx_control.channel as u8;
-                let status = (t_us > 0).then_some(Status {
+                let (fw_bytes, battery_pct) = (status.fw, status.battery_pct);
+                let status = t_ok.then_some(Status {
                     t_us,
                     battery_v: status.battery_v,
                     battery_pct: status.battery_pct,
@@ -210,6 +234,16 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     battery_chip: status.battery_chip,
                 });
                 let buffered = status.map_or(0, |s| s.buffered);
+                let seen = Seen {
+                    fw: fw_bytes,
+                    id,
+                    at_s: Instant::now().as_secs(),
+                    temp_c: f32::NAN,
+                    rh_pct: f32::NAN,
+                    charging: false,
+                    battery_pct,
+                    rssi,
+                };
                 let stored = ring.lock(|q| {
                     store_frame(
                         &mut q.borrow_mut(),
@@ -219,6 +253,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                         status,
                     )
                 });
+                UI.lock(|u| u.borrow_mut().1.heard(seen, &samples[..n as usize]));
                 if stored < n {
                     warn!("ring full: stored {stored}/{n} from {}", id_str(&id));
                 }
@@ -230,7 +265,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     nonce,
                     stored,
                     epoch_us: if SYNCED.load(Relaxed) { now_us() } else { 0 },
-                    wake_s: WAKE_S,
+                    wake_s: UI.lock(|u| u.borrow().0.wake_s),
                     flags: 0,
                 };
                 proto::encode(&Frame::Reply(reply), &mut buf)
@@ -255,6 +290,16 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             warn!("reply to {}: {e:?}", id_str(&device_id(&src)));
         }
         let _ = esp.remove_peer(&src);
+    }
+}
+
+/// Interns firmware versions and room names only while a quarter of the table is free, so they
+/// can't crowd out a new node's ID. Names already in the table always resolve.
+fn intern_spare(s: &str) -> Option<u64> {
+    if SYMBOLS.len() < 96 {
+        SYMBOLS.intern(s)
+    } else {
+        SYMBOLS.with(|all| all.iter().position(|x| *x == s).map(|i| i as u64))
     }
 }
 
@@ -392,5 +437,190 @@ async fn sntp_task(stack: Stack<'static>) {
             None => warn!("sntp: no answer"),
         }
         Timer::after_secs(if SYNCED.load(Relaxed) { 3600 } else { 5 }).await;
+    }
+}
+
+/// The web page, one connection at a time.
+#[embassy_executor::task]
+async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'static>) {
+    let (mut rx, mut tx) = ([0u8; 1536], [0u8; 2048]);
+    let mut req = [0u8; 1536];
+    stack.wait_config_up().await;
+    loop {
+        let mut sock = TcpSocket::new(stack, &mut rx, &mut tx);
+        sock.set_timeout(Some(Duration::from_secs(10)));
+        if sock.accept(80).await.is_err() {
+            continue;
+        }
+        let mut len = 0;
+        let head = loop {
+            if let Some((post, path, at, body_len)) = web::parse_head(&req[..len]) {
+                let route = match (post, path) {
+                    (false, b"/") => Route::Home,
+                    (false, b"/settings") => Route::Settings,
+                    (true, b"/name") => Route::Rename,
+                    (true, b"/settings") => Route::Save,
+                    _ => Route::NotFound,
+                };
+                break Some((route, at, at + body_len));
+            }
+            match sock.read(&mut req[len..]).await {
+                Ok(n) if n > 0 && len + n < req.len() => len += n,
+                _ => break None, // closed, timed out, or a head too big for us
+            }
+        };
+        if let Some((route, at, end)) = head
+            && end <= req.len()
+        {
+            while len < end {
+                match sock.read(&mut req[len..end]).await {
+                    Ok(n) if n > 0 => len += n,
+                    _ => break,
+                }
+            }
+            if len >= end {
+                let resp = respond(route, &req[at..end], ring, &mut flash);
+                let mut out = resp.as_bytes();
+                while !out.is_empty() {
+                    match sock.write(out).await {
+                        Ok(n) if n > 0 => out = &out[n..],
+                        _ => break,
+                    }
+                }
+            }
+        }
+        sock.close();
+        let _ = with_timeout(Duration::from_secs(2), sock.flush()).await;
+    }
+}
+
+enum Route {
+    Home,
+    Settings,
+    Rename,
+    Save,
+    NotFound,
+}
+
+fn respond(
+    route: Route,
+    body: &[u8],
+    ring: Shared,
+    flash: &mut FlashStorage,
+) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut page = alloc::string::String::new();
+    let (settings, nodes) = UI.lock(|u| *u.borrow());
+    let _ = match route {
+        Route::Home => {
+            let g = web::Gateway {
+                up_s: Instant::now().as_secs(),
+                channel: WIFI_CHANNEL.load(Relaxed),
+                time_synced: SYNCED.load(Relaxed),
+                waiting: ring.lock(|r| r.borrow().len()),
+                last_error: QWP_STATS.last_error.load(Relaxed),
+            };
+            web::render_home(&mut page, &settings, &nodes, &g)
+        }
+        Route::Settings => web::render_settings(&mut page, &settings, &nodes, ""),
+        Route::Rename => match rename(body, ring, flash) {
+            Ok(()) => return see_other(),
+            Err(msg) => {
+                let (settings, nodes) = UI.lock(|u| *u.borrow());
+                web::render_settings(&mut page, &settings, &nodes, msg)
+            }
+        },
+        Route::Save => {
+            let mut b = [0u8; 8];
+            let fahrenheit = web::form_value(body, "unit", &mut b) != Some("c");
+            let mut b = [0u8; 8];
+            let wake =
+                web::form_value(body, "wake", &mut b).and_then(|w| w.trim().parse::<u16>().ok());
+            let mut s = settings;
+            s.fahrenheit = fahrenheit;
+            if let Some(w) = wake {
+                s.wake_s = w.clamp(WAKE_MIN_S, WAKE_MAX_S);
+            }
+            UI.lock(|u| u.borrow_mut().0 = s);
+            save(flash, &s);
+            info!(
+                "settings: {} wake {} s",
+                if s.fahrenheit { "°F" } else { "°C" },
+                s.wake_s
+            );
+            return see_other();
+        }
+        Route::NotFound => {
+            return "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+    };
+    let mut resp = alloc::string::String::with_capacity(page.len() + 128);
+    let _ = write!(
+        resp,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    resp
+}
+
+fn see_other() -> alloc::string::String {
+    "HTTP/1.0 303 See Other\r\nLocation: /settings\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        .into()
+}
+
+/// A rename from the form: saved to flash, and to `device_locations` once the gateway has time.
+fn rename(body: &[u8], ring: Shared, flash: &mut FlashStorage) -> Result<(), &'static str> {
+    let (mut ib, mut nb) = ([0u8; 6], [0u8; 128]);
+    let id: [u8; 6] = web::form_value(body, "id", &mut ib)
+        .filter(|i| i.len() == 6 && i.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("That isn't a node ID.")?
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "That isn't a node ID.")?;
+    let name = web::form_value(body, "name", &mut nb).ok_or("That name is too long.")?;
+    let mut copy = [0u8; web::NAME_MAX];
+    let (s, stored) = UI.lock(|u| {
+        let mut u = u.borrow_mut();
+        let stored = u.0.rename(id, name).map(|n| {
+            copy[..n.len()].copy_from_slice(n.as_bytes());
+            n.len()
+        });
+        (u.0, stored)
+    });
+    let stored = stored.ok_or("No room for another name: clear one first.")?;
+    save(flash, &s);
+    let room = core::str::from_utf8(&copy[..stored]).unwrap_or("");
+    info!("rename {}: {room:?}", id_str(&id));
+    if room.is_empty() {
+        return Ok(());
+    }
+    if !SYNCED.load(Relaxed) {
+        warn!(
+            "rename {}: no time yet, so no device_locations row",
+            id_str(&id)
+        );
+        return Ok(());
+    }
+    match (SYMBOLS.intern(id_str(&id)), intern_spare(room)) {
+        (Some(dev), Some(room)) => ring.lock(|q| {
+            q.borrow_mut().push(Rec::Location {
+                dev: dev as u16,
+                room: room as u16,
+                t_us: now_us(),
+            })
+        }),
+        _ => warn!(
+            "rename {}: symbol table full, no device_locations row",
+            id_str(&id)
+        ),
+    }
+    Ok(())
+}
+
+fn save(flash: &mut FlashStorage, s: &Settings) {
+    if let Err(e) = flash.write(SETTINGS_ADDR, &s.to_bytes()) {
+        error!("settings: flash write failed: {e:?}");
     }
 }

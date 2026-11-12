@@ -4,6 +4,7 @@
 pub use qwp_embedded as qwp;
 
 pub mod proto;
+pub mod web;
 
 /// Sample flags (SPEC.md, Buffering and batching).
 pub const SENSOR_FAIL: u8 = 1 << 0;
@@ -20,6 +21,10 @@ pub const MAX17048: u8 = 0x36;
 pub const LC709203F: u8 = 0x0B;
 
 pub const RING_LEN: usize = 256; // ~4 h at 60 s
+
+/// The wake intervals a node accepts from the gateway, and the web page offers.
+pub const WAKE_MIN_S: u16 = 10;
+pub const WAKE_MAX_S: u16 = 3600;
 
 /// Sensirion CRC-8: polynomial 0x31, init 0xFF.
 fn crc8(data: &[u8]) -> u8 {
@@ -172,6 +177,20 @@ impl SampleRing {
             self.clear();
         }
     }
+
+    /// Keeps only the samples with epoch time, in order: after a reset, ones still in RTC seconds
+    /// have lost their timebase.
+    pub fn retain_sendable(&mut self) {
+        let mut n = 0;
+        for i in 0..self.len() {
+            let s = self.get(i);
+            if Clock::sendable(&s) {
+                *self.get_mut(n) = s;
+                n += 1;
+            }
+        }
+        self.len = n as u16;
+    }
 }
 
 /// The RTC's time since power-up on one fixed scale. esp-hal converts ticks to `us` with
@@ -198,9 +217,17 @@ pub struct Clock {
     /// this point stays put until one lands MIN_RATE_SPAN_US later.
     pub rate_rtc_us: i64,
     pub rate_epoch_us: i64,
+    /// Syncs refused in a row. REFUSALS of them and the gateway wins: it's the only time source.
+    pub refused: u8,
 }
 
 const EPOCH_MIN_S: u32 = 1_000_000_000; // 2001
+/// Gateway times outside 2020..2100 are ignored by nodes, and node status times by the gateway.
+pub const EPOCH_MIN_US: i64 = 1_577_836_800_000_000;
+pub const EPOCH_MAX_US: i64 = 4_102_444_800_000_000;
+const REFUSALS: u8 = 3;
+/// A rate further off than this is a time step, not the RC oscillator (measured: -3000).
+const PPM_MAX: f32 = 50_000.0;
 const DAY_US: i64 = 86_400_000_000;
 /// Shorter gaps than this make a noisy rate estimate; keep the old one.
 const MIN_RATE_SPAN_US: i64 = 300_000_000;
@@ -211,8 +238,9 @@ impl Clock {
         self.sync_epoch_us + dt + (dt as f64 * self.ppm as f64 / 1e6) as i64
     }
 
-    /// Takes an SNTP result: `epoch_us` was true at `rtc_us`. Rejects one more than a day from the
-    /// estimate once synced. Returns the step from the estimate, in µs.
+    /// Takes the gateway's time: `epoch_us` was true at `rtc_us`. Once synced, refuses one more
+    /// than a day from the estimate, unless REFUSALS in a row say so: then it starts over from it.
+    /// Returns the step from the estimate, in µs.
     pub fn sync(&mut self, rtc_us: i64, epoch_us: i64) -> Result<i64, i64> {
         if self.synced == 0 {
             *self = Self {
@@ -222,17 +250,26 @@ impl Clock {
                 ppm: 0.0,
                 rate_rtc_us: rtc_us,
                 rate_epoch_us: epoch_us,
+                refused: 0,
             };
             return Ok(0);
         }
         let step = epoch_us - self.epoch_us(rtc_us);
         if step.abs() > DAY_US {
-            return Err(step);
+            self.refused += 1;
+            if self.refused < REFUSALS {
+                return Err(step);
+            }
+            self.synced = 0;
+            self.sync(rtc_us, epoch_us)?;
+            return Ok(step);
         }
+        self.refused = 0;
         let rtc_span = rtc_us - self.rate_rtc_us;
         if rtc_span >= MIN_RATE_SPAN_US {
             let true_span = epoch_us - self.rate_epoch_us;
             self.ppm = ((true_span - rtc_span) as f64 * 1e6 / rtc_span as f64) as f32;
+            self.ppm = self.ppm.clamp(-PPM_MAX, PPM_MAX);
             self.rate_rtc_us = rtc_us;
             self.rate_epoch_us = epoch_us;
         }
@@ -281,12 +318,13 @@ pub fn sweep_skips(failures: u32, wake_s: u32) -> u32 {
     wakes_to_next_send(1, failures.saturating_sub(1), wake_s) - 1
 }
 
-/// Everything QuestDB gets: samples for `room_readings`, statuses for `device_status`. `dev` and
-/// `fw` are symbol ids: the device ID and firmware version strings, interned by the gateway.
+/// Everything QuestDB gets: samples for `room_readings`, statuses for `device_status`, renames for
+/// `device_locations`. `dev`, `fw` and `room` are symbol ids, interned by the gateway.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Rec {
     Reading { dev: u16, s: Sample },
     Status { dev: u16, fw: u16, s: Status },
+    Location { dev: u16, room: u16, t_us: i64 },
 }
 
 /// A node's ID: its MAC's last three bytes in lowercase hex.
@@ -316,7 +354,7 @@ pub struct Status {
     pub battery_chip: u8,
 }
 
-/// Both tables. Column types match the tables SPEC.md creates up front.
+/// All three tables. Column types match the tables SPEC.md creates up front.
 pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     use qwp::{FLOAT, LONG, SYMBOL};
     let readings = || {
@@ -385,6 +423,25 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
         e.i64s(status().map(|(_, _, s)| s.reset_reason as i64))?;
         e.i64s(status().map(|(_, _, s)| s.battery_chip as i64))?;
         e.timestamps(status().map(|(_, _, s)| s.t_us))?;
+    }
+
+    let moves = || {
+        recs.iter().filter_map(|r| match r {
+            Rec::Location { dev, room, t_us } => Some((*dev as u64, *room as u64, *t_us)),
+            _ => None,
+        })
+    };
+    let n = moves().count();
+    if n > 0 {
+        // nickname stays null (design doc)
+        e.table(
+            "device_locations",
+            n,
+            &[("device", SYMBOL), ("room", SYMBOL)],
+        )?;
+        e.symbols(moves().map(|(d, _, _)| d))?;
+        e.symbols(moves().map(|(_, r, _)| r))?;
+        e.timestamps(moves().map(|(_, _, t)| t))?;
     }
     Ok(())
 }
@@ -553,9 +610,42 @@ mod tests {
     fn clock_rejects_wild_sntp() {
         let mut c = Clock::default();
         c.sync(0, E0).unwrap();
-        let before = c;
+        let est = c.epoch_us(600_000_000);
         assert!(c.sync(600_000_000, E0 + 3 * DAY_US).is_err());
-        assert_eq!(c, before);
+        assert_eq!(c.epoch_us(600_000_000), est);
+        // the gateway insists: the third in a row wins, and the clock starts over from it
+        assert!(c.sync(660_000_000, E0 + 3 * DAY_US).is_err());
+        assert_eq!(
+            c.sync(720_000_000, E0 + 3 * DAY_US),
+            Ok(3 * DAY_US - 720_000_000)
+        );
+        assert_eq!(c.epoch_us(720_000_000), E0 + 3 * DAY_US);
+        assert_eq!((c.ppm, c.refused), (0.0, 0));
+    }
+
+    #[test]
+    fn clock_rate_clamped_across_a_time_step() {
+        let mut c = Clock::default();
+        c.sync(0, E0).unwrap();
+        // the gateway's time jumped an hour over 10 minutes: not something an RC oscillator does
+        c.sync(600_000_000, E0 + 600_000_000 + 3_600_000_000)
+            .unwrap();
+        assert_eq!(c.ppm, PPM_MAX);
+    }
+
+    #[test]
+    fn retain_sendable_drops_rtc_time_samples() {
+        let mut r = ring();
+        r.push(Sample::new(5, 20.0, 40.0, TIME_UNSYNCED)); // RTC seconds
+        r.push(Sample::new(1_700_000_000, 21.0, 40.0, 0));
+        r.push(Sample::new(6, 20.0, 40.0, TIME_UNSYNCED));
+        r.push(Sample::new(1_700_000_060, 22.0, 40.0, 0));
+        r.retain_sendable();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            (r.get(0).ts_s, r.get(1).ts_s),
+            (1_700_000_000, 1_700_000_060)
+        );
     }
 
     #[test]
@@ -604,13 +694,19 @@ mod tests {
                 },
                 Rec::Reading { dev: 0, s },
                 Rec::Reading { dev: 2, s },
+                Rec::Location {
+                    dev: 2,
+                    room: 0,
+                    t_us: 1,
+                },
             ],
         )
         .unwrap();
         let len = e.finish();
-        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 2);
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 3);
         let has = |n: &[u8]| buf[..len].windows(n.len()).any(|w| w == n);
         assert!(has(b"room_readings") && has(b"device_status") && has(b"fw_version"));
+        assert!(has(b"device_locations") && has(b"room") && !has(b"nickname"));
         assert!(has(b"channel") && !has(b"wifi_ms") && !has(b"cached_connect"));
     }
 
@@ -683,6 +779,13 @@ mod tests {
         r.push(Sample::new(1_700_000_000, 20.0, 40.0, 0));
         proto::apply_reply(&mut c, &mut r, 1, 1, &reply(1, 1, 0), 5);
         assert_eq!((r.len(), c.synced), (0, 0));
+        // nor does a time no gateway could have: it would overflow epoch_us later
+        let rep = reply(2, 0, i64::MAX);
+        assert_eq!(
+            proto::apply_reply(&mut c, &mut r, 2, 0, &rep, 5),
+            Some(Ok(0))
+        );
+        assert_eq!(c.synced, 0);
     }
 
     #[test]

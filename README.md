@@ -37,7 +37,9 @@ cargo run --release --bin node   # espflash flashes with partitions.csv and open
 ```
 
 A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off):
-tap RESET, then run the command.
+tap RESET, then run the command. Or let `scripts/flash-node.sh` (Linux) wait for it: it builds,
+then flashes whichever board shows up on USB next, so press RESET whenever it's ready. The
+gateway, already plugged in, never shows up anew, so it's never picked.
 
 The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's
 the only device on WiFi, so it's the only build that needs credentials:
@@ -49,9 +51,13 @@ WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --relea
 It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address
 in your router so it stays put.
 
+Its web page, at that address, shows each room's latest reading, battery and last-seen time. Its
+Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C and
+sets the nodes' wake interval. Those settings live in the gateway's flash.
+
 ## Host tests
 
-The logic in `src/lib.rs` and `src/proto.rs` runs on the host against a checkout of qwp-embedded next to this repo:
+The logic in `src/lib.rs`, `src/proto.rs` and `src/web.rs` runs on the host against a checkout of qwp-embedded next to this repo:
 
 ```sh
 rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib
@@ -70,11 +76,6 @@ Beyond the ones in [SPEC.md](SPEC.md#open-questions):
 
 - Enclosure: not designed yet. Maybe something more whimsical than esp-light-show's house. It
   matters for the side-by-side check, since self-heating inside the enclosure is the main error.
-
-## Todo
-
-- Flash helper: wait for a node to show up on USB after RESET and flash it right away, so there's
-  no racing the 30 s window.
 
 ## License
 

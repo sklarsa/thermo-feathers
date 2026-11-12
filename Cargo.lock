@@ -1956,6 +1956,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
  "log",
  "qwp-embedded",
  "sntpc",

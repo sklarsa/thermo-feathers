@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: sklarsa/qwp-embedded
-          ref: fc0b56fcb99d5758962748232bf8d4a8426aa612 # keep in step with Cargo.toml
+          ref: b15c0275841a5c7767928c44c12f6f05d4959349 # keep in step with Cargo.toml
           path: qwp-embedded
       - uses: dtolnay/rust-toolchain@stable
       # +stable: rust-toolchain.toml pins the Xtensa toolchain
