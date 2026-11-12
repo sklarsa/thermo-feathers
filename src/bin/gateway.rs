@@ -519,6 +519,7 @@ fn respond(
         time_synced: SYNCED.load(Relaxed),
         waiting: ring.lock(|r| r.borrow().len()),
         last_error: QWP_STATS.last_error.load(Relaxed),
+        questdb: QUESTDB,
     };
     let _ = match route {
         Route::Home(n) => web::render_home(&mut page, &settings, &nodes, &gateway(), n),

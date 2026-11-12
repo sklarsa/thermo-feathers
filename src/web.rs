@@ -178,6 +178,8 @@ pub struct Gateway {
     pub waiting: usize,
     /// qwp-embedded's `Stats::last_error`.
     pub last_error: u32,
+    /// QuestDB's ip:port, for a link to its web console.
+    pub questdb: &'static str,
 }
 
 /// HTML-escaped text.
@@ -378,12 +380,13 @@ pub fn render_home(
         0 => w.write_str("<span class=bad>WiFi down</span>")?,
         c => write!(w, "WiFi channel {c}")?,
     }
+    write!(w, " · <a href=\"http://{}/\">QuestDB</a>", Esc(g.questdb))?;
     match (g.waiting, g.last_error) {
-        (0, _) => w.write_str(" · QuestDB up to date")?,
-        (n, 0) => write!(w, " · QuestDB: {n} waiting")?,
+        (0, _) => w.write_str(" up to date")?,
+        (n, 0) => write!(w, ": {n} waiting")?,
         (n, e) => write!(
             w,
-            " · <span class=bad>QuestDB: {n} waiting, last error: {}</span>",
+            "<span class=bad>: {n} waiting, last error: {}</span>",
             match e {
                 1 => "connect",
                 2 => "read",
@@ -580,6 +583,7 @@ mod tests {
             up_s: 300,
             channel: 6,
             time_synced: true,
+            questdb: "10.0.0.2:9000",
             ..Default::default()
         };
         let mut h = String::new();
@@ -589,7 +593,8 @@ mod tests {
         assert!(h.contains("68.0°F") && h.contains("class=bad>battery 7%"));
         // bbbbbb: 300 s since heard, past 3 × 60 s
         assert!(h.contains("last seen 5m ago") && h.contains("Attic"));
-        assert!(h.contains("WiFi channel 6") && h.contains("QuestDB up to date"));
+        assert!(h.contains("WiFi channel 6") && h.contains("QuestDB</a> up to date"));
+        assert!(h.contains("href=\"http://10.0.0.2:9000/\""));
         assert!(h.contains("value=bbbbbb") && h.contains("value=\"Attic\""));
         assert!(h.contains("<summary>bbbbbb</summary>")); // unnamed: the ID is the name
         let mut h = String::new();
