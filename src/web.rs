@@ -226,18 +226,46 @@ const HEAD: &str = r#"<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">"#;
 
 const STYLE: &str = r#"<style>
-:root{--bg:#f6f5f2;--card:#fff;--fg:#1d1d1b;--dim:#6b6a66;--bad:#b3261e;--line:#e3e1dc}
-@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#22221f;--fg:#ecebe7;--dim:#9a9893;--bad:#f2867d;--line:#34332f}}
+:root{--bg:#f6f5f2;--card:#fff;--fg:#1d1d1b;--dim:#6b6a66;--bad:#b3261e;--ok:#1e6b3a;--okbg:#e3f1e7;--line:#e3e1dc}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#22221f;--fg:#ecebe7;--dim:#9a9893;--bad:#f2867d;--ok:#8fd4a5;--okbg:#1f3326;--line:#34332f}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif}
-main{max-width:34rem;margin:0 auto;padding:16px}h1{font-size:1.1rem;margin:0 0 12px;color:var(--dim);font-weight:600}
+main{max-width:34rem;margin:0 auto;padding:16px}h1{font-size:1.1rem;margin:0 0 12px;color:var(--dim);font-weight:600;display:flex;justify-content:space-between}
 .room{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:10px;display:grid;grid-template-columns:1fr auto;gap:2px 12px;align-items:baseline}
-.name{font-weight:600;font-size:1.1rem;overflow-wrap:anywhere}.t{font-size:2rem;font-weight:600;font-variant-numeric:tabular-nums;grid-row:span 2}
+.name{font-weight:600;font-size:1.1rem;overflow-wrap:anywhere;min-width:0}
+summary{cursor:pointer;list-style:none}summary::-webkit-details-marker{display:none}
+summary::after{content:" ✎";color:var(--dim);font-weight:400;font-size:.9rem}.name[open] summary::after{content:" ✕"}
+.t{font-size:2rem;font-weight:600;font-variant-numeric:tabular-nums;grid-row:span 2}
 .sub{color:var(--dim);font-size:.9rem}.bad{color:var(--bad);font-weight:600}.stale .t{color:var(--dim)}
+.note{padding:8px 12px;border-radius:8px;margin-bottom:12px;font-weight:600;background:var(--okbg);color:var(--ok)}
+.note.bad{background:transparent;border:1px solid var(--bad);color:var(--bad)}
 footer{color:var(--dim);font-size:.9rem;margin-top:16px}a{color:inherit}
-form{display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap}label{min-width:5rem;font-variant-numeric:tabular-nums}
-input,select,button{font:inherit;padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
-input[name=name]{flex:1;min-width:8rem}input[type=number]{width:6rem}button{cursor:pointer}
+input,select,button{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+button{cursor:pointer;background:var(--fg);color:var(--bg);border-color:var(--fg);font-weight:600}
+.rename{display:flex;gap:8px;margin:8px 0 4px}.rename input{flex:1;min-width:0}
+.stack label{display:flex;flex-direction:column;gap:4px;margin-bottom:16px;font-weight:600}
+.stack small{color:var(--dim);font-weight:400}.stack button{width:100%}
 </style></head><body><main>"#;
+
+/// Drops `/saved` from the address bar, so a reload doesn't say "Saved." again.
+const UNSAVE: &str = "<script>if(location.pathname.endsWith('/saved'))\
+history.replaceState(null,'',location.pathname.slice(0,-6)||'/')</script>";
+
+/// Swaps in fresh cards every 30 s, unless a rename is open or the tab is hidden.
+const REFRESH: &str = "<script>setInterval(async()=>{if(document.hidden||\
+document.querySelector('details[open]'))return;try{const t=await(await fetch('/')).text();\
+const n=new DOMParser().parseFromString(t,'text/html').getElementById('rooms');\
+if(n)document.getElementById('rooms').replaceWith(n)}catch(e){}},30000)</script>";
+
+/// A line above the page: what was just saved, or why it wasn't.
+pub type Note<'a> = Option<Result<&'a str, &'a str>>;
+
+fn note(w: &mut impl Write, n: Note) -> fmt::Result {
+    match n {
+        Some(Ok(m)) => write!(w, "<p class=note>{}</p>", Esc(m)),
+        Some(Err(m)) => write!(w, "<p class='note bad'>{}</p>", Esc(m)),
+        None => Ok(()),
+    }
+}
 
 /// Every node the page knows: heard from since boot, or only named. Sorted by name, then ID.
 type Row = ([u8; 6], Option<Seen>);
@@ -263,11 +291,20 @@ fn rows(s: &Settings, nodes: &Nodes) -> ([Row; 2 * MAX_NODES], usize) {
     (out, n)
 }
 
-/// The room view: one card per node, temperature first. Reloads itself every 30 s.
-pub fn render_home(w: &mut impl Write, s: &Settings, nodes: &Nodes, g: &Gateway) -> fmt::Result {
+/// The room view: one card per node, temperature first. Tapping a name opens its rename box.
+pub fn render_home(
+    w: &mut impl Write,
+    s: &Settings,
+    nodes: &Nodes,
+    g: &Gateway,
+    n: Note,
+) -> fmt::Result {
     w.write_str(HEAD)?;
-    w.write_str("<meta http-equiv=refresh content=30><title>Rooms</title>")?;
+    w.write_str("<title>Rooms</title>")?;
     w.write_str(STYLE)?;
+    w.write_str("<h1>Rooms<a href=/settings>Settings</a></h1>")?;
+    note(w, n)?;
+    w.write_str("<div id=rooms>")?;
     let (rows, n) = rows(s, nodes);
     if n == 0 {
         w.write_str("<p class=sub>No nodes heard from since the gateway started.</p>")?;
@@ -275,25 +312,29 @@ pub fn render_home(w: &mut impl Write, s: &Settings, nodes: &Nodes, g: &Gateway)
     let unit = if s.fahrenheit { "°F" } else { "°C" };
     let stale_s = STALE_WAKES * s.wake_s as u64;
     for (id, seen) in &rows[..n] {
-        let name = s.name(id).unwrap_or(id_str(id));
-        let Some(x) = seen else {
-            write!(
-                w,
-                "<section class='room stale'><div class=name>{}</div><div class=t>–</div>\
-                 <div class=sub>not heard from since the gateway started · {}</div></section>",
-                Esc(name),
-                id_str(id)
-            )?;
-            continue;
-        };
-        let age = g.up_s.saturating_sub(x.at_s);
-        let stale = age > stale_s;
+        let named = s.name(id);
+        let age = seen.map(|x| g.up_s.saturating_sub(x.at_s));
+        let stale = age.is_none_or(|a| a > stale_s);
         write!(
             w,
-            "<section class='room{}'><div class=name>{}</div><div class=t>",
+            "<section class='room{}'><details class=name><summary>{}</summary>\
+             <form class=rename method=post action=/name>\
+             <input type=hidden name=id value={}>\
+             <input name=name value=\"{}\" placeholder='Room name' maxlength={NAME_MAX} \
+             aria-label='Room name'><button>Save</button></form></details><div class=t>",
             if stale { " stale" } else { "" },
-            Esc(name)
+            Esc(named.unwrap_or(id_str(id))),
+            id_str(id),
+            Esc(named.unwrap_or(""))
         )?;
+        let (Some(x), Some(age)) = (seen, age) else {
+            w.write_str("–</div><div class=sub>not heard from since the gateway started")?;
+            if named.is_some() {
+                write!(w, "<br>{}", id_str(id))?;
+            }
+            w.write_str("</div></section>")?;
+            continue;
+        };
         if x.temp_c.is_nan() {
             w.write_str("–")?;
         } else {
@@ -321,10 +362,13 @@ pub fn render_home(w: &mut impl Write, s: &Settings, nodes: &Nodes, g: &Gateway)
         } else {
             write!(w, "{} ago", Age(age))?;
         }
+        w.write_str("<br>")?;
+        if named.is_some() {
+            write!(w, "{} · ", id_str(id))?;
+        }
         write!(
             w,
-            "<br>{} · fw {} · {} dBm</div></section>",
-            id_str(id),
+            "fw {} · {} dBm</div></section>",
             Esc(fw_str(&x.fw)),
             x.rssi
         )?;
@@ -353,50 +397,38 @@ pub fn render_home(w: &mut impl Write, s: &Settings, nodes: &Nodes, g: &Gateway)
     if !g.time_synced {
         w.write_str(" · <span class=bad>no time yet</span>")?;
     }
-    write!(
-        w,
-        " · up {} · <a href=/settings>Settings</a></footer>",
-        Age(g.up_s)
-    )?;
+    write!(w, " · up {}</footer></div>", Age(g.up_s))?;
+    w.write_str(UNSAVE)?;
+    w.write_str(REFRESH)?;
     w.write_str("</main></body></html>")
 }
 
-/// Names, unit and wake interval. No auto-reload: it would wipe what's being typed.
-pub fn render_settings(w: &mut impl Write, s: &Settings, nodes: &Nodes, msg: &str) -> fmt::Result {
+/// Unit and wake interval. Names are set on the room cards, next to their readings.
+pub fn render_settings(w: &mut impl Write, s: &Settings, n: Note) -> fmt::Result {
     w.write_str(HEAD)?;
     w.write_str("<title>Settings</title>")?;
     w.write_str(STYLE)?;
-    w.write_str("<h1><a href=/>Rooms</a> / Settings</h1>")?;
-    if !msg.is_empty() {
-        write!(w, "<p class=bad>{}</p>", Esc(msg))?;
-    }
-    let (rows, n) = rows(s, nodes);
-    for (id, _) in &rows[..n] {
-        let name = s.name(id).unwrap_or("");
-        let id = id_str(id);
-        write!(
-            w,
-            "<form method=post action=/name><label>{id}</label>\
-             <input type=hidden name=id value={id}>\
-             <input name=name value=\"{}\" placeholder='room name' maxlength={NAME_MAX}>\
-             <button>Rename</button></form>",
-            Esc(name)
-        )?;
-    }
+    w.write_str("<h1><a href=/>← Rooms</a></h1>")?;
+    note(w, n)?;
     write!(
         w,
-        "<form method=post action=/settings><label>Unit</label><select name=unit>\
-         <option value=f{}>°F</option><option value=c{}>°C</option></select>\
-         <label>Wake every</label><input type=number name=wake min={WAKE_MIN_S} max={WAKE_MAX_S} \
-         value={}> s <button>Save</button></form>",
+        "<form class=stack method=post action=/settings>\
+         <label>Temperature unit<select name=unit>\
+         <option value=f{}>°F</option><option value=c{}>°C</option></select></label>\
+         <label>Wake interval, seconds<input type=number name=wake min={WAKE_MIN_S} \
+         max={WAKE_MAX_S} value={}><small>How often each node reads and sends, from {WAKE_MIN_S} \
+         to {WAKE_MAX_S}. Nodes switch at their next send; shorter drains batteries faster.\
+         </small></label><button>Save</button></form>",
         if s.fahrenheit { " selected" } else { "" },
         if s.fahrenheit { "" } else { " selected" },
         s.wake_s
     )?;
     w.write_str(
-        "<p class=sub>Nodes pick up a new wake interval at their next send. Names go to QuestDB's \
-         device_locations.</p></main></body></html>",
-    )
+        "<p class=sub>To rename a room, tap its name on the Rooms page. Each rename is also a \
+         row in QuestDB's device_locations.</p>",
+    )?;
+    w.write_str(UNSAVE)?;
+    w.write_str("</main></body></html>")
 }
 
 /// A request's head, once `buf` holds all of it: (is POST, path without the query, head length,
@@ -551,15 +583,18 @@ mod tests {
             ..Default::default()
         };
         let mut h = String::new();
-        render_home(&mut h, &s, &n, &g).unwrap();
+        render_home(&mut h, &s, &n, &g, Some(Ok("Saved."))).unwrap();
+        assert!(h.contains("class=note>Saved."));
         assert!(h.contains("&lt;b&gt;Kid&#39;s room&lt;/b&gt;") && !h.contains("<b>Kid"));
         assert!(h.contains("68.0°F") && h.contains("class=bad>battery 7%"));
         // bbbbbb: 300 s since heard, past 3 × 60 s
         assert!(h.contains("last seen 5m ago") && h.contains("Attic"));
         assert!(h.contains("WiFi channel 6") && h.contains("QuestDB up to date"));
-        let mut h = String::new();
-        render_settings(&mut h, &s, &n, "").unwrap();
         assert!(h.contains("value=bbbbbb") && h.contains("value=\"Attic\""));
+        assert!(h.contains("<summary>bbbbbb</summary>")); // unnamed: the ID is the name
+        let mut h = String::new();
+        render_settings(&mut h, &s, Some(Err("nope"))).unwrap();
+        assert!(h.contains("class='note bad'>nope") && h.contains("value=60"));
     }
 
     #[test]

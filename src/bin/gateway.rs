@@ -456,8 +456,10 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
         let head = loop {
             if let Some((post, path, at, body_len)) = web::parse_head(&req[..len]) {
                 let route = match (post, path) {
-                    (false, b"/") => Route::Home,
-                    (false, b"/settings") => Route::Settings,
+                    (false, b"/") => Route::Home(None),
+                    (false, b"/saved") => Route::Home(Some(Ok("Saved."))),
+                    (false, b"/settings") => Route::Settings(None),
+                    (false, b"/settings/saved") => Route::Settings(Some(Ok("Saved."))),
                     (true, b"/name") => Route::Rename,
                     (true, b"/settings") => Route::Save,
                     _ => Route::NotFound,
@@ -495,8 +497,8 @@ async fn http(stack: Stack<'static>, ring: Shared, mut flash: FlashStorage<'stat
 }
 
 enum Route {
-    Home,
-    Settings,
+    Home(web::Note<'static>),
+    Settings(web::Note<'static>),
     Rename,
     Save,
     NotFound,
@@ -511,24 +513,19 @@ fn respond(
     use core::fmt::Write;
     let mut page = alloc::string::String::new();
     let (settings, nodes) = UI.lock(|u| *u.borrow());
+    let gateway = || web::Gateway {
+        up_s: Instant::now().as_secs(),
+        channel: WIFI_CHANNEL.load(Relaxed),
+        time_synced: SYNCED.load(Relaxed),
+        waiting: ring.lock(|r| r.borrow().len()),
+        last_error: QWP_STATS.last_error.load(Relaxed),
+    };
     let _ = match route {
-        Route::Home => {
-            let g = web::Gateway {
-                up_s: Instant::now().as_secs(),
-                channel: WIFI_CHANNEL.load(Relaxed),
-                time_synced: SYNCED.load(Relaxed),
-                waiting: ring.lock(|r| r.borrow().len()),
-                last_error: QWP_STATS.last_error.load(Relaxed),
-            };
-            web::render_home(&mut page, &settings, &nodes, &g)
-        }
-        Route::Settings => web::render_settings(&mut page, &settings, &nodes, ""),
+        Route::Home(n) => web::render_home(&mut page, &settings, &nodes, &gateway(), n),
+        Route::Settings(n) => web::render_settings(&mut page, &settings, n),
         Route::Rename => match rename(body, ring, flash) {
-            Ok(()) => return see_other(),
-            Err(msg) => {
-                let (settings, nodes) = UI.lock(|u| *u.borrow());
-                web::render_settings(&mut page, &settings, &nodes, msg)
-            }
+            Ok(()) => return see_other("/saved"),
+            Err(msg) => web::render_home(&mut page, &settings, &nodes, &gateway(), Some(Err(msg))),
         },
         Route::Save => {
             let mut b = [0u8; 8];
@@ -548,7 +545,7 @@ fn respond(
                 if s.fahrenheit { "°F" } else { "°C" },
                 s.wake_s
             );
-            return see_other();
+            return see_other("/settings/saved");
         }
         Route::NotFound => {
             return "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -565,9 +562,10 @@ fn respond(
     resp
 }
 
-fn see_other() -> alloc::string::String {
-    "HTTP/1.0 303 See Other\r\nLocation: /settings\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        .into()
+fn see_other(to: &str) -> alloc::string::String {
+    alloc::format!(
+        "HTTP/1.0 303 See Other\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
 }
 
 /// A rename from the form: saved to flash, and to `device_locations` once the gateway has time.
