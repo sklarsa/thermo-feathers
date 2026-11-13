@@ -2,8 +2,8 @@
 //! entries, a sector apart, each `[seq: u32, label: 20 bytes, state: u32, crc: u32]`. The valid
 //! entry with the higher `seq` wins, and `seq` picks slot `(seq - 1) % 2`.
 //!
-//! Ours instead of esp-bootloader-esp-idf's `Ota`: that reads entries through a misaligned pointer,
-//! which is a LoadStoreAlignment exception on Xtensa (it panicked a node on every cold boot).
+//! Ours instead of esp-bootloader-esp-idf's `Ota`: that reads entries by casting a `[u8; 32]` to a
+//! `repr(C)` struct of `u32`s, a misaligned read (undefined behaviour; never seen to fault here).
 
 /// Where the second entry starts.
 pub const ENTRY_1: u32 = 0x1000;
