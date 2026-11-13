@@ -40,6 +40,10 @@ sys.stdout.buffer.write(b + hashlib.sha256(b).digest()[:4])
 ' "$THERMO_MASTER" "$mac" >"$creds"
             espflash write-bin --chip esp32s3 --port "$port" --after no-reset 0x9000 "$creds"
             echo "node $(echo "$mac" | cut -c7-12): key written"
+            # otadata (partitions.csv) names the slot to boot, and espflash leaves it: after an
+            # update over the air it would boot the old image in ota_1, not this flash in ota_0.
+            # Erased, the bootloader boots ota_0.
+            espflash erase-region --chip esp32s3 --port "$port" --after no-reset 0xC000 0x2000
             espflash flash --chip esp32s3 --partition-table partitions.csv \
                 --bootloader bootloader/bootloader.bin \
                 --port "$port" target/xtensa-esp32s3-none-elf/release/node "$@"

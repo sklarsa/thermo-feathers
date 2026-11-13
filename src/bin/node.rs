@@ -257,6 +257,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     // bootloader abandons it at the next wake otherwise. Only a cold boot can be the first.
     let on_trial = cold && flash::on_trial(&mut flash);
     let creds = flash::creds(&mut flash);
+    if creds.is_none() {
+        warn!("no key in creds: this node won't reach the gateway until scripts/flash-node.sh");
+    }
     info!(
         "fw {}{}",
         core::str::from_utf8(&st.fw).unwrap_or("?"),
@@ -311,10 +314,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                 let _ = esp.set_pmk(&key.pmk);
                 radio(&mut esp, st, &key, &rtc_us, woke_us).await
             }
-            None => {
-                warn!("no key in creds: flash this node with scripts/flash-node.sh");
-                None
-            }
+            None => None,
         };
         if flags.is_some() {
             st.panics = 0;
