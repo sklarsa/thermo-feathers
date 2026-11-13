@@ -82,8 +82,11 @@ scripts/ota.sh <gateway address> gateway
 ```
 
 It writes the image to its other slot and restarts into it once QuestDB has everything it holds.
-The new image is kept once it reaches WiFi, the time server and QuestDB; otherwise it restarts after
-10 minutes and the bootloader goes back to the old one. Like the nodes, a confirmed gateway image
+Before restarting it notes the nodes it heard in the last 3 wake intervals. The new image is kept
+once it reaches WiFi, the time server and QuestDB and has heard from each of those nodes; otherwise
+it restarts after 10 minutes (or 3 wake intervals and a minute, if longer) and the bootloader goes
+back to the old one, whose page names the nodes the update didn't hear. A node that's gone for good
+blocks updates until it's back: upload again once it reports. Like the nodes, a confirmed gateway image
 that crashes 3 times in a row goes back to the one before it.
 
 It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address

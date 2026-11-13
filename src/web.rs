@@ -259,6 +259,99 @@ impl Nodes {
     }
 }
 
+/// Nodes a gateway update has to hear from before it's kept: the ones heard in the last few wakes
+/// before the update restart. Kept through the restart in RTC memory. After a rollback, the same
+/// record lists the nodes the update didn't hear, for the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Expected {
+    ids: [[u8; 6]; MAX_NODES],
+    n: usize,
+}
+
+/// `magic | state | n | ids | crc8`. RTC memory holds garbage after a power cut: the magic and
+/// CRC tell.
+pub const EXPECTED_LEN: usize = 4 + 1 + 1 + 6 * MAX_NODES + 1;
+const EXPECTED_MAGIC: [u8; 4] = *b"TFX1";
+
+/// What an `Expected` in RTC memory is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Trial {
+    /// Written before an update restart: the update has to hear these.
+    Hear = 1,
+    /// Written by an update going back: these weren't heard.
+    Missed = 2,
+}
+
+impl Expected {
+    pub const EMPTY: Self = Self {
+        ids: [[0; 6]; MAX_NODES],
+        n: 0,
+    };
+
+    /// The nodes in `nodes` heard in the last `within_s` seconds of uptime `now_s`.
+    pub fn recent(nodes: &Nodes, now_s: u64, within_s: u64) -> Self {
+        let mut e = Self::default();
+        for s in nodes.0.iter().flatten() {
+            if now_s.saturating_sub(s.at_s) <= within_s {
+                e.ids[e.n] = s.id;
+                e.n += 1;
+            }
+        }
+        e
+    }
+
+    /// The ones `nodes` hasn't heard from.
+    pub fn missing(&self, nodes: &Nodes) -> Self {
+        let mut e = Self::default();
+        for id in self.ids() {
+            if !nodes.0.iter().flatten().any(|s| s.id == *id) {
+                e.ids[e.n] = *id;
+                e.n += 1;
+            }
+        }
+        e
+    }
+
+    pub fn ids(&self) -> &[[u8; 6]] {
+        &self.ids[..self.n]
+    }
+
+    pub fn to_bytes(&self, t: Trial) -> [u8; EXPECTED_LEN] {
+        let mut b = [0; EXPECTED_LEN];
+        b[..4].copy_from_slice(&EXPECTED_MAGIC);
+        b[4] = t as u8;
+        b[5] = self.n as u8;
+        for (o, id) in b[6..].chunks_exact_mut(6).zip(self.ids()) {
+            o.copy_from_slice(id);
+        }
+        b[EXPECTED_LEN - 1] = crc8(&b[..EXPECTED_LEN - 1]);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8; EXPECTED_LEN]) -> Option<(Self, Trial)> {
+        let t = match b[4] {
+            1 => Trial::Hear,
+            2 => Trial::Missed,
+            _ => return None,
+        };
+        let n = b[5] as usize;
+        if b[..4] != EXPECTED_MAGIC
+            || n > MAX_NODES
+            || crc8(&b[..EXPECTED_LEN - 1]) != b[EXPECTED_LEN - 1]
+        {
+            return None;
+        }
+        let mut e = Self {
+            n,
+            ..Self::default()
+        };
+        for (id, i) in e.ids.iter_mut().zip(b[6..].chunks_exact(6)).take(n) {
+            id.copy_from_slice(i);
+        }
+        Some((e, t))
+    }
+}
+
 /// Where one node's update stands.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Progress {
@@ -383,6 +476,8 @@ pub struct Gateway<'a> {
     pub last_error: u32,
     /// Frames of ours without a good tag since boot, and the device ID of the last.
     pub unsigned: (u32, [u8; 6]),
+    /// The nodes the last gateway update didn't hear from, if it went back for that.
+    pub missed: Expected,
     /// QuestDB's ip:port in use, for a link to its web console.
     pub questdb: &'a str,
     /// The build's QuestDB address and time server, shown when the settings leave them empty.
@@ -537,6 +632,13 @@ pub fn render_home(
     w.write_str(STYLE)?;
     w.write_str("<h1>Rooms<a href=/settings>Settings</a></h1>")?;
     note(w, n)?;
+    if !g.missed.ids().is_empty() {
+        w.write_str("<p class='note bad'>The last gateway update went back: it didn't hear from")?;
+        for id in g.missed.ids() {
+            write!(w, " {}", Esc(s.name(id).unwrap_or(id_str(id))))?;
+        }
+        w.write_str(". Upload it again once they report.</p>")?;
+    }
     w.write_str("<div id=rooms>")?;
     let (rows, n) = rows(s, nodes);
     if n == 0 {
@@ -943,6 +1045,49 @@ mod tests {
         let mut h = String::new();
         render_home(&mut h, &s, &n, &g, None, None).unwrap();
         assert!(h.contains("3 frames without our key, last from 610338"));
+        assert!(!h.contains("went back"));
+        let mut gone = Nodes::default();
+        gone.heard(seen(b"aaaaaa", 0), &[]);
+        gone.heard(seen(b"dddddd", 0), &[]);
+        let g = Gateway {
+            missed: Expected::recent(&gone, 0, 0),
+            ..g
+        };
+        let mut h = String::new();
+        render_home(&mut h, &s, &n, &g, None, None).unwrap();
+        assert!(h.contains("didn't hear from &lt;b&gt;Kid&#39;s room&lt;/b&gt; dddddd."));
+    }
+
+    #[test]
+    fn expected_nodes() {
+        let mut n = Nodes::default();
+        n.heard(seen(b"aaaaaa", 100), &[]);
+        n.heard(seen(b"bbbbbb", 10), &[]);
+        n.heard(seen(b"cccccc", 60), &[]);
+        // at 100 s, heard in the last 40: aaaaaa and cccccc
+        let e = Expected::recent(&n, 100, 40);
+        assert_eq!(e.ids(), &[*b"aaaaaa", *b"cccccc"]);
+        let mut after = Nodes::default();
+        assert_eq!(e.missing(&after), e);
+        after.heard(seen(b"cccccc", 5), &[]);
+        after.heard(seen(b"bbbbbb", 5), &[]); // not expected, doesn't matter
+        assert_eq!(e.missing(&after).ids(), &[*b"aaaaaa"]);
+        after.heard(seen(b"aaaaaa", 6), &[]);
+        assert!(e.missing(&after).ids().is_empty());
+        // through RTC memory, and garbage refused
+        let b = e.to_bytes(Trial::Missed);
+        assert_eq!(Expected::from_bytes(&b), Some((e, Trial::Missed)));
+        assert_eq!(Expected::from_bytes(&[0; EXPECTED_LEN]), None);
+        for i in [0, 4, 5, 7, EXPECTED_LEN - 1] {
+            let mut bad = b;
+            bad[i] ^= 0x40;
+            assert_eq!(Expected::from_bytes(&bad), None, "byte {i}");
+        }
+        let empty = Expected::default();
+        assert_eq!(
+            Expected::from_bytes(&empty.to_bytes(Trial::Hear)),
+            Some((empty, Trial::Hear))
+        );
     }
 
     #[test]
