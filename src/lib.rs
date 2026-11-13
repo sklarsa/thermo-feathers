@@ -27,7 +27,7 @@ pub const LC709203F: u8 = 0x0B;
 pub const RING_LEN: usize = 256; // ~4 h at 60 s
 
 /// The wake intervals a node accepts from the gateway, and the web page offers.
-pub const WAKE_MIN_S: u16 = 10;
+pub const WAKE_MIN_S: u16 = 5;
 pub const WAKE_MAX_S: u16 = 3600;
 
 /// Sensirion CRC-8: polynomial 0x31, init 0xFF.
