@@ -158,13 +158,21 @@ pub fn fall_back(flash: &mut FlashStorage) -> bool {
     let Some((at, e0, e1)) = read_otadata(flash) else {
         return false;
     };
-    let Some((which, e)) = otadata::fall_back(&e0, &e1, b.n) else {
+    let Some(writes) = otadata::fall_back(&e0, &e1, b.n) else {
         warn!("crashing, and no earlier image to go back to");
         return false;
     };
-    let ok = flash
-        .write(at + which as u32 * otadata::ENTRY_1, &e)
-        .is_ok();
+    let write = |flash: &mut FlashStorage, (which, e): (usize, [u8; 32])| {
+        flash
+            .write(at + which as u32 * otadata::ENTRY_1, &e)
+            .is_ok()
+    };
+    // the first write does the switching; the second only keeps the two from taking turns
+    let [switch, retire] = writes;
+    let ok = write(flash, switch);
+    if ok && !write(flash, retire) {
+        warn!("couldn't mark the crashing image invalid");
+    }
     if ok {
         error!("crashing: going back to the image in ota_{}", 1 - b.n);
     }

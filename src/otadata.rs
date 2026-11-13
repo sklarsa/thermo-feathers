@@ -77,9 +77,11 @@ pub fn switch_to(e0: &[u8; 32], e1: &[u8; 32], to: usize) -> (usize, [u8; 32]) {
     (which, entry(seq, NEW))
 }
 
-/// For a confirmed image that keeps crashing: what to write, and to which entry, to boot the
-/// other slot again, if otadata still names it as a good image. `booted` is the slot running now.
-pub fn fall_back(e0: &[u8; 32], e1: &[u8; 32], booted: usize) -> Option<(usize, [u8; 32])> {
+/// For a confirmed image that keeps crashing: the writes, in order, that boot the other slot
+/// again, if otadata still names it as a good image. `booted` is the slot running now. The first
+/// is enough on its own (it has the higher seq); the second marks the crashing image INVALID, so
+/// if the old one crashes too it doesn't fall back to this one, and the two don't take turns.
+pub fn fall_back(e0: &[u8; 32], e1: &[u8; 32], booted: usize) -> Option<[(usize, [u8; 32]); 2]> {
     let (cur, seq, _) = current(e0, e1)?;
     let other = if cur == 0 { e1 } else { e0 };
     let (old, state) = live(other)?;
@@ -87,8 +89,8 @@ pub fn fall_back(e0: &[u8; 32], e1: &[u8; 32], booted: usize) -> Option<(usize, 
     if state != VALID || slot_of(old) != to {
         return None;
     }
-    let seq = seq + if slot_of(seq + 1) == to { 1 } else { 2 };
-    Some((1 - cur, entry(seq, VALID)))
+    let next = seq + if slot_of(seq + 1) == to { 1 } else { 2 };
+    Some([(1 - cur, entry(next, VALID)), (cur, entry(seq, INVALID))])
 }
 
 #[cfg(test)]
@@ -148,10 +150,14 @@ mod tests {
     fn falling_back() {
         // slot 1 confirmed at seq 2, then slot 0 confirmed at seq 3 and crashing: back to slot 1
         let (e0, e1) = (entry(2, VALID), entry(3, VALID));
-        assert_eq!(fall_back(&e0, &e1, 0), Some((0, entry(4, VALID))));
-        let (w, e) = fall_back(&e0, &e1, 0).unwrap();
-        let (e0b, e1b) = if w == 0 { (e, e1) } else { (e0, e) };
+        let w = fall_back(&e0, &e1, 0).unwrap();
+        assert_eq!(w, [(0, entry(4, VALID)), (1, entry(3, INVALID))]);
+        // after the first write alone (a power cut between them), slot 1 already boots
+        assert_eq!(current(&w[0].1, &e1).map(|c| slot_of(c.1)), Some(1));
+        // after both: slot 1 boots, and if it crashes too there's nothing to go back to
+        let (e0b, e1b) = (w[0].1, w[1].1);
         assert_eq!(current(&e0b, &e1b).map(|c| slot_of(c.1)), Some(1));
+        assert_eq!(fall_back(&e0b, &e1b, 1), None);
         // nothing good to go back to: after a USB flash, or when the other was rolled back
         assert_eq!(fall_back(&ERASED, &ERASED, 0), None);
         assert_eq!(fall_back(&entry(2, ABORTED), &entry(3, VALID), 0), None);
