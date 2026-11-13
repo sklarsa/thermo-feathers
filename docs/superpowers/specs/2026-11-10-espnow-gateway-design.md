@@ -17,7 +17,7 @@ The user wants room sensors that run for months on a battery, can be moved aroun
 and show up in QuestDB and somewhere they can glance at. The answer: the nodes talk only ESP-NOW,
 straight to one wall-powered **gateway**. The gateway is the only device on WiFi. It forwards to
 QuestDB, serves a web page that shows the rooms and holds their names and settings, and pushes
-firmware updates to the nodes. It has no display for v1. A display and buttons are designed below
+firmware updates to the nodes. It has no display for v1. A small scrolling LED matrix is designed below
 as a later phase.
 
 ## Goals
@@ -37,9 +37,9 @@ as a later phase.
 ## Non-goals
 
 - No sensors on the gateway. The LSM303AGR comes off, and s3-sensors' accelerometer streaming ends.
-- No display or buttons in v1. The user chose headless to avoid any purchase. They're designed in
-  [Later: screen and buttons](#later-screen-and-buttons), and they plug into the free STEMMA QT
-  port with no rework.
+- No display in v1. The user chose headless to avoid any purchase. The display is designed in
+  [Later: LED matrix](#later-led-matrix), and it plugs into the free STEMMA QT port with no
+  rework.
 - No WiFi on the nodes at all, not even for firmware updates.
 - Gateway firmware updates go over USB for v1. Only the nodes update over the air.
 - No authentication on the web page. It's on the home LAN only (my call).
@@ -245,7 +245,7 @@ timer wake. The 30 s window gives a chance to attach.
 4. **Web page:** the room view, names, units, wake interval, `device_locations` rows.
 5. **Node OTA over ESP-NOW,** after the rollback check.
 6. **Side-by-side check,** as in SPEC.md.
-7. **Later, when the user buys the parts:** screen and buttons (below).
+7. **Later, when the user buys the part:** the LED matrix (below).
 
 ## Left to the builder
 
@@ -256,40 +256,29 @@ timer wake. The 30 s window gives a chance to attach.
 - Where on the gateway's flash the names and unit live.
 - Repo layout for the two binaries.
 
-## Later: screen and buttons
+## Later: LED matrix
 
-This isn't part of v1. It's here so the parts can be bought and plugged in later without
-redesigning anything. The user chose all of this before deciding to go headless.
+This isn't part of v1. Decided 2026-11-10, replacing an earlier OLED-and-buttons plan: no
+soldering, one part.
 
-**Parts.** No soldering, about $47:
+**Part:** [Adafruit IS31FL3741 13×9 RGB LED matrix](https://www.adafruit.com/product/5201) (5201,
+$14.95), on a STEMMA QT cable from the gateway's port (I2C0, SDA GPIO3, SCL GPIO4, GPIO7 high to
+power the port). I²C address 0x30. It runs on 3.3 V; greens and blues are dimmer than at 5 V.
 
-| Qty | Part | PID |
-|---|---|---|
-| 1 | Monochrome 1.3" 128×64 OLED, STEMMA QT, SSD1306, two STEMMA QT ports | 938 |
-| 1 | LED Arcade Button 1x4 STEMMA QT board, I²C 0x3A | 5296 |
-| 4 | 24 mm mini LED arcade button. Check that its tabs take 0.11" connectors. | 3429–3433 |
-| 1 | 0.11" quick-connect wire pairs, 10-pack | 1152 |
-| 2 | STEMMA QT cables, Feather → OLED → button board | |
+**Layouts**, chosen on the web page, mocked up live in `.superpowers/brainstorm/` on 2026-11-10:
+- **D (default): tiny letters, still.** Room initial and temperature in a 3×5 font (`O76`), a
+  humidity bar along the bottom two rows (length = % RH), 3 s per room.
+- **A: full line, scrolling.** `Office 76° 41%` in a 5×7 font, about 5 s per room at 20 columns/s.
+- **B: name and temperature, scrolling.** `Office 76°`.
+- **C: big still digits.** 5×7 temperature, 3 s per room; the bottom row shows which room.
 
-The Feather's STEMMA QT port is I2C0, SDA GPIO3 and SCL GPIO4, and GPIO7 must be driven high to
-power the port. The buttons snap into 24 mm panel holes. The user decided against the Feather's BOOT
-button, which is fiddly and limits the enclosure.
+In every layout the temperature is tinted blue (cool) through white (about 72 °F) to amber (warm),
+and a node stale after about 3 missed wakes shows in red: blinking dashes in the still layouts,
+`Bedroom no data 12m` in the scrolling ones. The unit is the web page's °F/°C.
 
-**Behaviour:**
-- The screen is off by default and goes dark about a minute after the last press, so the OLED
-  doesn't burn in. Its half-brightness life is roughly 10,000–20,000 h.
-- Page 1 shows all four rooms at once, one line each: name, temperature, battery %. For example,
-  `Office  76F 88%`.
+**Web page settings**, kept in flash with the names: layout, scroll speed, brightness, and off or a
+night schedule. The page may also draw a live copy of the matrix.
 
-| Button | Press | Hold |
-|---|---|---|
-| 1 | Screen on, then next page. Page 2 shows humidity and how long since each node last reported. | Screen off now |
-| 2 | Toggle °F/°C, the same setting as on the web page | none |
-| 3 | Gateway info: IP address, WiFi channel, QuestDB connected or not | none |
-| 4 | Highlight the node that reported longest ago | none |
-
-My calls:
-- Button 1's LED glows dimly so it can be found in the dark.
-- Button 4's LED lights while any node is stale or low on battery.
-- A fifth node or more scrolls.
-- Fonts and layout are the builder's.
+**Firmware:** a small no_std driver for the IS31FL3741 over esp-hal's async I²C (Adafruit's
+libraries are Arduino and Python only), a 5×7 font, and a task on the gateway that redraws from its
+node table.
