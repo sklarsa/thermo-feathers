@@ -113,18 +113,22 @@ static mut STATE: State = unsafe { core::mem::zeroed() };
 /// Recorded as `reset_reason` after a panic. esp-hal's SocResetReason values stay below this.
 const PANIC_REASON: u32 = 255;
 
+/// Set by `custom_halt`, read and cleared at the next boot. A static of its own, not part of
+/// State: the panic can come while a `&mut State` is live up the stack, and a second one would
+/// alias it.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut PANICKED: u32 = 0;
+const PANICKED_MAGIC: u32 = 0x7EF0_DEAD;
+
 /// A panic sleeps the node for a wake interval instead of hanging it awake: the wake after is an
 /// ordinary deep-sleep wake, so the RTC ring survives, and a panic on every boot costs one wake a
 /// minute rather than a reboot loop. device_status shows it as reset_reason 255.
 #[unsafe(no_mangle)]
 fn custom_halt() -> ! {
-    // SAFETY: we're dying; nothing else will touch STATE or LPWR again
+    // SAFETY: a plain word written by value, never borrowed; we're dying, so nothing else will
+    // touch it or LPWR again
     unsafe {
-        let st = &mut *core::ptr::addr_of_mut!(STATE);
-        if st.magic == MAGIC {
-            st.reset_reason = PANIC_REASON;
-            st.panics = st.panics.saturating_add(1);
-        }
+        *core::ptr::addr_of_mut!(PANICKED) = PANICKED_MAGIC;
         let mut lp = LowPower::new(esp_hal::peripherals::LPWR::steal());
         lp.set_wakeup_deadline(
             esp_hal::time::Instant::now() + esp_hal::time::Duration::from_secs(WAKE_S as u64),
@@ -184,6 +188,12 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         info!("cold boot: {reset:?}, kept {} samples", st.ring.len());
     }
     st.ring.fix();
+    // SAFETY: a plain word, read and written by value; custom_halt is the only other user
+    let panicked = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(PANICKED), 0) };
+    if panicked == PANICKED_MAGIC {
+        st.reset_reason = PANIC_REASON;
+        st.panics = st.panics.saturating_add(1);
+    }
     // A confirmed image that keeps crashing, before it can reach the gateway: the bootloader only
     // rolls back unconfirmed ones, so go back by hand.
     if st.panics >= PANICS_TO_FALL_BACK {
