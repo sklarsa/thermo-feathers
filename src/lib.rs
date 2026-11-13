@@ -4,8 +4,10 @@
 pub use qwp_embedded as qwp;
 
 pub mod image;
+pub mod keys;
 pub mod otadata;
 pub mod proto;
+pub mod sha256;
 pub mod web;
 
 /// Sample flags (SPEC.md, Buffering and batching).

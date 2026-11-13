@@ -42,10 +42,11 @@ use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use qwp_embedded::sender::{self, Buffers, SharedRing, Stats};
 use qwp_embedded::{Ring, Symbols};
-use sha2::{Digest, Sha256};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 use thermo_feathers::image;
+use thermo_feathers::keys::{self, Dir};
+use thermo_feathers::sha256::sha256;
 
 #[path = "../flash.rs"]
 mod flash;
@@ -79,6 +80,8 @@ macro_rules! mk_static {
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
+/// 64 hex digits; every node's key comes from it (see keys.rs and scripts/flash-node.sh).
+const MASTER: &str = env!("THERMO_MASTER");
 const QUESTDB: &str = env!("QUESTDB_ADDR"); // ip:port of QuestDB's HTTP endpoint, e.g. 192.168.1.10:9000
 const NTP_SERVER: &str = "pool.ntp.org";
 const GATEWAY_PROJECT: &str = "thermo-gateway";
@@ -107,6 +110,9 @@ static SYMBOLS: Symbols<128, 24> = Symbols::sized();
 static UI: BlockingMutex<CriticalSectionRawMutex, RefCell<(Settings, Nodes)>> =
     BlockingMutex::new(RefCell::new((Settings::DEFAULT, Nodes::EMPTY)));
 static QWP_STATS: Stats = Stats::new();
+/// Frames of ours without a good tag: how many, and the device ID of the last.
+static UNSIGNED: BlockingMutex<CriticalSectionRawMutex, Cell<(u32, [u8; 6])>> =
+    BlockingMutex::new(Cell::new((0, [0; 6])));
 /// Where the sender sends: set at boot, and again when the settings page changes it.
 static QWP_ADDR: sender::Addr = sender::Addr::new(core::net::SocketAddrV4::new(
     core::net::Ipv4Addr::UNSPECIFIED,
@@ -256,7 +262,10 @@ async fn main(spawner: Spawner) -> ! {
     );
     let mut controller = WifiController::new(
         peripherals.WIFI,
-        ControllerConfig::default().with_initial_config(station),
+        ControllerConfig::default()
+            .with_initial_config(station)
+            // one per node it keeps (PEERS); the gateway runs no SoftAP to share them with
+            .with_espnow_max_encrypt_num(PEERS as u8),
     )
     .unwrap();
     // A dozing station misses ESP-NOW frames
@@ -297,26 +306,49 @@ async fn main(spawner: Spawner) -> ! {
 
 /// Answers every node: Hello to Discover, Reply to Data once its records are in the ring.
 async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
+    let master = keys::parse_master(MASTER).expect("THERMO_MASTER must be 64 hex digits");
+    esp.set_pmk(&keys::pmk(&master)).expect("ESP-NOW PMK");
     let fw_unknown = SYMBOLS.intern("?").unwrap();
     let mut buf = [0u8; FRAME_MAX];
+    let mut peers = Peers([([0; 6], 0); PEERS]);
     loop {
         let r = esp.receive_async().await;
         let src = r.info.src_address;
-        let len = match proto::decode(r.data()) {
+        // Only a frame tagged with this MAC's key is one of ours. Anything else, spoofed or from
+        // a node flashed without its key, is counted and dropped before it touches anything.
+        let key = keys::node_key(&master, &src);
+        let Some(frame) = keys::open(&key, Dir::ToGateway, r.data()).and_then(proto::decode) else {
+            if proto::decode(r.data()).is_some() {
+                UNSIGNED.lock(|u| u.set((u.get().0.wrapping_add(1), device_id(&src))));
+            }
+            continue;
+        };
+        let lmk = keys::lmk(&key);
+        let len = match frame {
             // Not before joining WiFi: until then the radio is scanning, and a node would keep a
             // channel the gateway is about to leave.
-            Some(Frame::Discover) if WIFI_CHANNEL.load(Relaxed) != 0 => {
+            Frame::Discover if WIFI_CHANNEL.load(Relaxed) != 0 => {
                 // the channel this arrived on is the one the gateway is on now
                 let channel = r.info.rx_control.channel as u8;
                 info!("discover from {}, ch {channel}", id_str(&device_id(&src)));
-                proto::encode(&Frame::Hello { channel }, &mut buf)
+                // in the clear: the node drops its old peer entry for us to hear it, and only
+                // makes us an encrypted peer once it knows who we are. Then we do the same.
+                let len = proto::encode(&Frame::Hello { channel }, &mut buf);
+                let len = keys::seal(&key, Dir::ToNode, &mut buf, len);
+                if peers.keep(&mut esp, src, None)
+                    && let Err(e) = esp.send_async(&src, &buf[..len]).await
+                {
+                    warn!("hello to {}: {e:?}", id_str(&device_id(&src)));
+                }
+                peers.keep(&mut esp, src, Some(lmk));
+                continue;
             }
-            Some(Frame::Data {
+            Frame::Data {
                 nonce,
                 status,
                 n,
                 samples,
-            }) => {
+            } => {
                 let id = device_id(&src);
                 let fw_len = status.fw.iter().position(|&b| b == 0).unwrap_or(12);
                 let fw = core::str::from_utf8(&status.fw[..fw_len]).unwrap_or("?");
@@ -396,7 +428,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                 };
                 proto::encode(&Frame::Reply(reply), &mut buf)
             }
-            Some(Frame::Fetch { offset }) => {
+            Frame::Fetch { offset } => {
                 let id = device_id(&src);
                 let chunk = IMAGE.lock(|i| {
                     let mut i = i.borrow_mut();
@@ -435,24 +467,60 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             }
             _ => continue, // someone else's ESP-NOW, or ours from a newer version
         };
-        // A peer only for the reply: ESP-NOW's peer table holds about 20, and boards come and go
-        let peer = PeerInfo {
-            interface: EspNowWifiInterface::Station,
-            peer_address: src,
-            lmk: None,
-            channel: None,
-            encrypt: false,
-        };
-        if !esp.peer_exists(&src)
-            && let Err(e) = esp.add_peer(peer)
-        {
-            warn!("peer {}: {e:?}", id_str(&device_id(&src)));
+        let len = keys::seal(&key, Dir::ToNode, &mut buf, len);
+        if !peers.touch(&mut esp, src, lmk) {
+            warn!("peer {}: can't add", id_str(&device_id(&src)));
             continue;
         }
         if let Err(e) = esp.send_async(&src, &buf[..len]).await {
             warn!("reply to {}: {e:?}", id_str(&device_id(&src)));
         }
-        let _ = esp.remove_peer(&src);
+    }
+}
+
+/// ESP-NOW peers kept: one per node heard, encrypted, so the gateway can read what they send.
+/// ESP-NOW holds 20 peers in all; the least recently heard goes first.
+const PEERS: usize = 16;
+
+struct Peers([([u8; 6], u64); PEERS]);
+
+impl Peers {
+    /// (Re)adds `mac`, encrypted with `lmk` or in the clear without. Returns whether it took.
+    fn keep(&mut self, esp: &mut EspNow, mac: [u8; 6], lmk: Option<[u8; 16]>) -> bool {
+        let i = match self.0.iter().position(|p| p.0 == mac) {
+            Some(i) => i,
+            None => {
+                // empty slots have time 0, so they go before any real one
+                let i = (0..PEERS).min_by_key(|&i| self.0[i].1).unwrap_or(0);
+                if self.0[i].1 != 0 {
+                    let _ = esp.remove_peer(&self.0[i].0);
+                }
+                i
+            }
+        };
+        self.0[i] = (mac, Instant::now().as_secs() + 1);
+        if esp.peer_exists(&mac) {
+            let _ = esp.remove_peer(&mac);
+        }
+        esp.add_peer(PeerInfo {
+            interface: EspNowWifiInterface::Station,
+            peer_address: mac,
+            lmk,
+            channel: None,
+            encrypt: lmk.is_some(),
+        })
+        .is_ok()
+    }
+
+    /// Makes sure `mac` is an encrypted peer, and marks it heard.
+    fn touch(&mut self, esp: &mut EspNow, mac: [u8; 6], lmk: [u8; 16]) -> bool {
+        match self.0.iter_mut().find(|p| p.0 == mac) {
+            Some(p) if esp.peer_exists(&mac) => {
+                p.1 = Instant::now().as_secs() + 1;
+                true
+            }
+            _ => self.keep(esp, mac, Some(lmk)),
+        }
     }
 }
 
@@ -765,6 +833,7 @@ fn respond(route: Route, body: &[u8], ring: Shared) -> (alloc::string::String, b
         time_synced: SYNCED.load(Relaxed),
         waiting: ring.lock(|r| r.borrow().len()),
         last_error: QWP_STATS.last_error.load(Relaxed),
+        unsigned: UNSIGNED.lock(|u| u.get()),
         questdb,
         questdb_default: QUESTDB,
         ntp_default: NTP_SERVER,
@@ -1034,7 +1103,7 @@ fn check_image<'a>(img: &'a [u8], project: &str) -> Result<(&'a str, [u8; 32]), 
     if at + 32 != img.len() {
         return Err("bytes after the image's end");
     }
-    let digest: [u8; 32] = Sha256::digest(&img[..at]).into();
+    let digest = sha256(&img[..at]);
     if digest[..] != img[at..] {
         return Err("the image is damaged: its SHA-256 doesn't match");
     }
@@ -1053,10 +1122,7 @@ fn check_image<'a>(img: &'a [u8], project: &str) -> Result<(&'a str, [u8; 32]), 
 fn check(img: &[u8], ids: &[[u8; 6]]) -> Result<(Rollout, [u8; 32]), &'static str> {
     let (version, digest) = check_image(img, image::NODE_PROJECT)?;
     let fw = image::build_id(version, &digest);
-    Ok((
-        Rollout::new(fw, img.len() as u32, ids),
-        Sha256::digest(img).into(),
-    ))
+    Ok((Rollout::new(fw, img.len() as u32, ids), sha256(img)))
 }
 
 /// The nodes `?to=` names: `all` for every node the page knows, or IDs.

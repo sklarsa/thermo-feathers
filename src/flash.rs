@@ -4,7 +4,8 @@
 use esp_bootloader_esp_idf::partitions::{self, PARTITION_TABLE_MAX_LEN};
 use esp_storage::FlashStorage;
 use log::{error, info, warn};
-use sha2::{Digest, Sha256};
+use thermo_feathers::keys::{CREDS_LEN, Creds};
+use thermo_feathers::sha256::Sha256;
 use thermo_feathers::{image, otadata};
 
 pub const SECTOR: u32 = 4096;
@@ -14,6 +15,10 @@ const APP: u8 = 0;
 const OTA_0: u8 = 0x10;
 const DATA: u8 = 1;
 const OTADATA: u8 = 0;
+#[allow(dead_code)] // the node's only, like creds()
+const CUSTOM: u8 = 0x40;
+#[allow(dead_code)]
+const CREDS: u8 = 0;
 
 /// An app slot: which one (0 or 1), and where it is.
 #[derive(Clone, Copy)]
@@ -103,11 +108,20 @@ pub fn verify(flash: &mut FlashStorage, slot: Slot, project: &str) -> Result<u32
     flash
         .read(slot.offset + at, &mut want)
         .map_err(|_| "flash read")?;
-    let got: [u8; 32] = sha.finalize().into();
+    let got = sha.finalize();
     if got != want {
         return Err("the image in flash is damaged");
     }
     Ok(at + 32)
+}
+
+/// The node's keys, from its creds partition, which scripts/flash-node.sh writes.
+#[allow(dead_code)] // the gateway works keys out from the master secret
+pub fn creds(flash: &mut FlashStorage) -> Option<Creds> {
+    let (at, _) = find(flash, CUSTOM, CREDS)?;
+    let mut b = [0u8; CREDS_LEN];
+    flash.read(at, &mut b).ok()?;
+    Creds::from_bytes(&b)
 }
 
 /// otadata's address and its two entries.
