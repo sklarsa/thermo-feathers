@@ -120,7 +120,9 @@ impl Settings {
 
     pub fn set_questdb(&mut self, s: &str) -> Result<(), &'static str> {
         let s = s.trim();
-        if !s.is_empty() && s.parse::<core::net::SocketAddrV4>().is_err() {
+        // the length too: a port with leading zeros parses, and would overrun the field
+        if !s.is_empty() && (s.len() > QUESTDB_MAX || s.parse::<core::net::SocketAddrV4>().is_err())
+        {
             return Err("The QuestDB address is an IPv4 address and port, like 192.168.1.10:9000.");
         }
         self.questdb = Text::set(s);
@@ -660,7 +662,8 @@ pub fn render_settings(
          </small></label>\
          <label>QuestDB address<input name=questdb value=\"{}\" placeholder=\"{}\" \
          maxlength={QUESTDB_MAX}><small>ip:port of its HTTP endpoint. Empty for the one built \
-         in. The gateway restarts to use a new one, once what it holds has reached the old one.\
+         in. The gateway switches to a new one right away, and sends it whatever the old one hasn't \
+         stored.\
          </small></label>\
          <label>Time server<input name=ntp value=\"{}\" placeholder=\"{}\" maxlength={NTP_MAX}>\
          <small>Empty for the one built in.</small></label>\
@@ -823,6 +826,7 @@ mod tests {
             ("10.0.0.2:9000", "time.example.com")
         );
         assert!(q.set_questdb("questdb:9000").is_err() && q.set_ntp("a b").is_err());
+        assert!(q.set_questdb("1.2.3.4:0000000000000000000009000").is_err());
         // a TFS1 save from before: its names and unit survive, the new fields start empty
         let mut old = [0u8; SETTINGS_LEN];
         old[..V1_LEN - 1].copy_from_slice(&b[..V1_LEN - 1]);

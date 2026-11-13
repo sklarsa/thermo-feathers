@@ -26,7 +26,13 @@ use embassy_net::{
 use embassy_sync::blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;
-use esp_hal::{clock::CpuClock, psram::Psram, rng::Rng, timer::timg::TimerGroup};
+use esp_hal::{
+    clock::CpuClock,
+    psram::Psram,
+    rng::Rng,
+    rtc_cntl::{Rtc, RwdtStage, RwdtStageAction, SocResetReason},
+    timer::timg::TimerGroup,
+};
 use esp_radio::esp_now::{EspNow, EspNowWifiInterface, PeerInfo};
 use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ControllerConfig, Interface, PowerSaveMode, WifiController,
@@ -101,6 +107,11 @@ static SYMBOLS: Symbols<128, 24> = Symbols::sized();
 static UI: BlockingMutex<CriticalSectionRawMutex, RefCell<(Settings, Nodes)>> =
     BlockingMutex::new(RefCell::new((Settings::DEFAULT, Nodes::EMPTY)));
 static QWP_STATS: Stats = Stats::new();
+/// Where the sender sends: set at boot, and again when the settings page changes it.
+static QWP_ADDR: sender::Addr = sender::Addr::new(core::net::SocketAddrV4::new(
+    core::net::Ipv4Addr::UNSPECIFIED,
+    0,
+));
 
 /// Settings and updates write flash from more than one task.
 static FLASH: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<FlashStorage<'static>>>> =
@@ -163,8 +174,25 @@ fn now_us() -> i64 {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
-    info!("reset reason: {:?}", esp_hal::system::reset_reason());
+    let reset = esp_hal::system::reset_reason();
+    info!("reset reason: {reset:?}");
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    if matches!(
+        reset,
+        Some(SocResetReason::CoreRtcWdt | SocResetReason::CpuRtcWdt | SocResetReason::SysRtcWdt)
+    ) {
+        warn!("the watchdog reset us: a hang, counted as a crash");
+        set_panics(panics().saturating_add(1));
+    }
+    // A hang is a reset, fed by a task: if the executor stops running tasks, it stops.
+    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
+    rtc.rwdt
+        .set_stage_action(RwdtStage::Stage0, RwdtStageAction::ResetCore);
+    rtc.rwdt.set_timeout(
+        RwdtStage::Stage0,
+        esp_hal::time::Duration::from_secs(WATCHDOG_S),
+    );
+    rtc.rwdt.enable();
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
 
@@ -194,10 +222,8 @@ async fn main(spawner: Spawner) -> ! {
         if trial { ", on trial" } else { "" }
     );
     FLASH.lock(|f| *f.borrow_mut() = Some(flash));
-    let questdb = UI.lock(|u| u.borrow().0.questdb().parse().ok());
-    let questdb =
-        questdb.unwrap_or_else(|| QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port"));
-    info!("questdb: {questdb}");
+    QWP_ADDR.set(questdb_addr(&UI.lock(|u| u.borrow().0)));
+    info!("questdb: {}", QWP_ADDR.get());
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
@@ -258,13 +284,13 @@ async fn main(spawner: Spawner) -> ! {
                 tcp_rx: mk_static!([u8; 2048], [0u8; 2048]),
                 scratch,
             },
-            questdb,
         )
         .unwrap(),
     );
     spawner.spawn(report(stack, ring).unwrap());
     spawner.spawn(http(stack, ring).unwrap());
     spawner.spawn(healthy(trial).unwrap());
+    spawner.spawn(watchdog(mk_static!(Rtc<'static>, rtc)).unwrap());
 
     espnow(esp, ring).await
 }
@@ -478,21 +504,27 @@ async fn connection(mut controller: WifiController<'static>) {
     }
 }
 
+/// Seconds without a feed before the RTC watchdog resets the gateway.
+const WATCHDOG_S: u64 = 30;
+
+#[embassy_executor::task]
+async fn watchdog(rtc: &'static mut Rtc<'static>) {
+    loop {
+        rtc.rwdt.feed();
+        Timer::after_secs(5).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
 
 #[embassy_executor::task]
-async fn sender(
-    stack: Stack<'static>,
-    ring: Shared,
-    buffers: Buffers<Rec>,
-    addr: core::net::SocketAddrV4,
-) {
+async fn sender(stack: Stack<'static>, ring: Shared, buffers: Buffers<Rec>) {
     let rng = Rng::new();
     let config = sender::Config {
-        addr,
+        addr: &QWP_ADDR,
         client_id: concat!("thermo-gateway/", env!("CARGO_PKG_VERSION")),
         symbols: &SYMBOLS,
         batch_interval: Duration::from_millis(100),
@@ -608,14 +640,14 @@ async fn http(stack: Stack<'static>, ring: Shared) {
                     let mut to = [0u8; 128];
                     let q = h.query.len().min(to.len());
                     to[..q].copy_from_slice(&h.query[..q]);
-                    let early = len.min(at + cl);
+                    let early = len.min(at.saturating_add(cl));
                     let resp = upload(&mut sock, &req[at..early], cl, &to[..q]).await;
                     write_all(&mut sock, resp.as_bytes()).await;
                     break None;
                 }
                 if h.post && h.path == b"/update/gateway" {
                     let (at, cl) = (h.len, h.content_length);
-                    let early = len.min(at + cl);
+                    let early = len.min(at.saturating_add(cl));
                     let resp;
                     (resp, restart) = self_update(&mut sock, &req[at..early], cl).await;
                     write_all(&mut sock, resp.as_bytes()).await;
@@ -631,7 +663,7 @@ async fn http(stack: Stack<'static>, ring: Shared) {
                     (true, b"/settings") => Route::Save,
                     _ => Route::NotFound,
                 };
-                break Some((route, at, at + body_len));
+                break Some((route, at, at.saturating_add(body_len)));
             }
             if len == req.len() {
                 break None; // a head too big for us
@@ -805,9 +837,9 @@ fn respond(route: Route, body: &[u8], ring: Shared) -> (alloc::string::String, b
                 s.questdb(),
                 s.ntp()
             );
-            // the sender takes its address once, at boot
-            let restart = s.questdb() != settings.questdb();
-            return (see_other("/settings/saved"), restart);
+            // the sender moves over, taking what QuestDB hasn't acked with it
+            QWP_ADDR.set(questdb_addr(&s));
+            return (see_other("/settings/saved"), false);
         }
         Route::NotFound => {
             return (
@@ -817,6 +849,14 @@ fn respond(route: Route, body: &[u8], ring: Shared) -> (alloc::string::String, b
         }
     };
     (html(&page), false)
+}
+
+/// The settings' QuestDB address, or the build's.
+fn questdb_addr(s: &Settings) -> core::net::SocketAddrV4 {
+    s.questdb()
+        .parse()
+        .ok()
+        .unwrap_or_else(|| QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port"))
 }
 
 fn html(page: &str) -> alloc::string::String {

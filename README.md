@@ -83,8 +83,8 @@ in your router so it stays put.
 
 Its web page, at that address, shows each room's latest reading, battery and last-seen time. Its
 Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C, sets
-the nodes' wake interval, and can override the build's QuestDB address and time server; a new
-QuestDB address takes a restart, which the gateway does itself. Those settings live in the
+the nodes' wake interval, and can override the build's QuestDB address and time server; the
+gateway switches to a new QuestDB address right away, taking along what the old one hadn't stored. Those settings live in the
 gateway's flash. Node and gateway firmware can be uploaded there too.
 
 ## Host tests

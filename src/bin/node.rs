@@ -19,7 +19,7 @@ use esp_hal::{
     gpio::{Level, Output, OutputConfig},
     i2c::master::{Config as I2cConfig, I2c},
     rtc_cntl::{
-        Rtc, SocResetReason,
+        Rtc, RwdtStage, RwdtStageAction, SocResetReason,
         sleep::{LowPower, RtcSleepConfig},
     },
     time::Rate,
@@ -65,6 +65,9 @@ const FLASH_WINDOW: Duration = Duration::from_secs(30);
 const REPLY_WAIT: Duration = Duration::from_millis(50);
 const HELLO_WAIT: Duration = Duration::from_millis(30);
 const RADIO_CAP: Duration = Duration::from_secs(2);
+/// Longest a wake may last before the RTC watchdog resets the node: past the flash window plus a
+/// whole update. A hang then costs minutes of battery, not all of it, and counts as a crash.
+const WATCHDOG: Duration = Duration::from_secs(300);
 
 /// Bump the low half when State's layout changes. A new MAGIC drops the buffered samples, at the
 /// update and again if it rolls back, and the image that rolls back sits out a flash window.
@@ -113,18 +116,25 @@ static mut STATE: State = unsafe { core::mem::zeroed() };
 /// Recorded as `reset_reason` after a panic. esp-hal's SocResetReason values stay below this.
 const PANIC_REASON: u32 = 255;
 
+/// Set by `custom_halt`, read and cleared at the next boot. A static of its own, not part of
+/// State: the panic can come while a `&mut State` is live up the stack, and a second one would
+/// alias it.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut PANICKED: u32 = 0;
+const PANICKED_MAGIC: u32 = 0x7EF0_DEAD;
+
 /// A panic sleeps the node for a wake interval instead of hanging it awake: the wake after is an
 /// ordinary deep-sleep wake, so the RTC ring survives, and a panic on every boot costs one wake a
 /// minute rather than a reboot loop. device_status shows it as reset_reason 255.
 #[unsafe(no_mangle)]
 fn custom_halt() -> ! {
-    // SAFETY: we're dying; nothing else will touch STATE or LPWR again
+    // SAFETY: a plain word written by value, never borrowed; we're dying, so nothing else will
+    // touch it or LPWR again
     unsafe {
-        let st = &mut *core::ptr::addr_of_mut!(STATE);
-        if st.magic == MAGIC {
-            st.reset_reason = PANIC_REASON;
-            st.panics = st.panics.saturating_add(1);
-        }
+        *core::ptr::addr_of_mut!(PANICKED) = PANICKED_MAGIC;
+        Rtc::new(esp_hal::peripherals::RTC_TIMER::steal())
+            .rwdt
+            .disable();
         let mut lp = LowPower::new(esp_hal::peripherals::LPWR::steal());
         lp.set_wakeup_deadline(
             esp_hal::time::Instant::now() + esp_hal::time::Duration::from_secs(WAKE_S as u64),
@@ -139,7 +149,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz));
     let mut flash = FlashStorage::new(peripherals.FLASH);
     let reset = esp_hal::system::reset_reason();
-    let rtc = Rtc::new(peripherals.RTC_TIMER);
+    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
+    // A core reset leaves RTC memory, so State and the ring come through it. Off for deep sleep,
+    // which it would otherwise end.
+    rtc.rwdt
+        .set_stage_action(RwdtStage::Stage0, RwdtStageAction::ResetCore);
+    rtc.rwdt.set_timeout(
+        RwdtStage::Stage0,
+        esp_hal::time::Duration::from_millis(WATCHDOG.as_millis()),
+    );
+    rtc.rwdt.enable();
     // esp-hal keeps this boot's slow-clock calibration in STORE1
     let cal_now = esp_hal::peripherals::LPWR::regs().store1().read().bits();
 
@@ -165,10 +184,13 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             });
         // SAFETY: SampleRing is plain data; this copy is moved back below or dropped
         let ring = keep.then(|| unsafe { core::ptr::read(&st.ring) });
+        // crashes in a row survive too, so a hang the watchdog ends still counts toward fall_back
+        let panics = if keep { st.panics } else { 0 };
         // ponytail: magic + wake cause, no CRC; a garbled header after a brownout is caught by
         // the reset reason, and SampleRing::fix guards the indexes either way
         // SAFETY: State is valid zeroed
         *st = unsafe { core::mem::zeroed() };
+        st.panics = panics;
         if let Some(r) = ring {
             st.ring = r;
             st.ring.fix();
@@ -184,6 +206,19 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         info!("cold boot: {reset:?}, kept {} samples", st.ring.len());
     }
     st.ring.fix();
+    // SAFETY: a plain word, read and written by value; custom_halt is the only other user
+    let panicked = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(PANICKED), 0) };
+    if panicked == PANICKED_MAGIC {
+        st.reset_reason = PANIC_REASON;
+        st.panics = st.panics.saturating_add(1);
+    }
+    if matches!(
+        reset,
+        Some(SocResetReason::CoreRtcWdt | SocResetReason::CpuRtcWdt | SocResetReason::SysRtcWdt)
+    ) {
+        warn!("the watchdog ended the last wake");
+        st.panics = st.panics.saturating_add(1);
+    }
     // A confirmed image that keeps crashing, before it can reach the gateway: the bootloader only
     // rolls back unconfirmed ones, so go back by hand.
     if st.panics >= PANICS_TO_FALL_BACK {
@@ -284,8 +319,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                     "update offered; {} wakes until we try again",
                     st.update_skip
                 );
-            } else if !charging && (st.battery_pct < UPDATE_MIN_PCT || st.battery_chip == 2) {
-                // the LC709203F is detected but not read: no charge level to go by
+            } else if !charging && (st.battery_pct < UPDATE_MIN_PCT || st.battery_chip != 1) {
+                // only the MAX17048 is read: without it there's no charge level to go by (and
+                // no gauge at all means never over the air; USB still works)
                 info!("update offered; waiting for charge or {UPDATE_MIN_PCT} %");
             } else {
                 // before, so a crash mid-update backs off too; a good update restarts anyway
@@ -316,6 +352,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         (now - woke_us) / 1000,
         sleep_us / 1000
     );
+    rtc.rwdt.disable();
     let mut lp = LowPower::new(peripherals.LPWR);
     lp.set_wakeup_deadline(
         esp_hal::time::Instant::now() + esp_hal::time::Duration::from_micros(sleep_us),
