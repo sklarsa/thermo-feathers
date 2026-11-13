@@ -35,8 +35,15 @@ The enclosure isn't designed yet. Pins and power rules are in [SPEC.md](SPEC.md#
 Same toolchain as s3-sensors: `espup install --targets esp32s3`, source `~/export-esp.sh`, then
 
 ```sh
-scripts/flash-node.sh   # Linux: builds, then flashes the next board to show up on USB
+THERMO_MASTER=... scripts/flash-node.sh   # Linux: builds, then flashes the next board on USB
 ```
+
+`THERMO_MASTER` is 64 hex digits (`openssl rand -hex 32`, once), kept secret and the same for the
+gateway. Every ESP-NOW frame is tagged with a key worked out from it and the node's MAC, and the
+link is encrypted with ESP-NOW's own CCMP on top: the gateway ignores what it can't verify. The
+script writes the node's key into its `creds` partition, so a node needs this one USB flash to
+join, and joins by itself once it has it. The gateway's page counts frames that arrive without a
+good key, and names the last node that sent one.
 
 A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off), so
 the script waits for one to show up: press RESET whenever it's ready. The gateway, already plugged
@@ -63,7 +70,8 @@ The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothi
 the only device on WiFi, so it's the only build that needs credentials:
 
 ```sh
-WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --release --bin gateway
+WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 THERMO_MASTER=... \
+    cargo run --release --bin gateway
 ```
 
 `cargo run` flashes the rollback bootloader too. After that first USB flash, the gateway updates

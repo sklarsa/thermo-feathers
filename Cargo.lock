@@ -1959,7 +1959,6 @@ dependencies = [
  "esp-storage",
  "log",
  "qwp-embedded",
- "sha2",
  "sntpc",
  "sntpc-net-embassy",
  "static_cell",

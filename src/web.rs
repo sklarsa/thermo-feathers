@@ -381,6 +381,8 @@ pub struct Gateway<'a> {
     pub waiting: usize,
     /// qwp-embedded's `Stats::last_error`.
     pub last_error: u32,
+    /// Frames of ours without a good tag since boot, and the device ID of the last.
+    pub unsigned: (u32, [u8; 6]),
     /// QuestDB's ip:port in use, for a link to its web console.
     pub questdb: &'a str,
     /// The build's QuestDB address and time server, shown when the settings leave them empty.
@@ -625,6 +627,15 @@ pub fn render_home(
     }
     if !g.time_synced {
         w.write_str(" · <span class=bad>no time yet</span>")?;
+    }
+    if g.unsigned.0 > 0 {
+        write!(
+            w,
+            " · <span class=bad>{} frames without our key, last from {}: flash it with \
+             scripts/flash-node.sh</span>",
+            g.unsigned.0,
+            Esc(core::str::from_utf8(&g.unsigned.1).unwrap_or("?"))
+        )?;
     }
     write!(
         w,
@@ -924,6 +935,14 @@ mod tests {
         assert!(h.contains("Running 0.4.0-a1b2c3") && h.contains("placeholder=\"10.0.0.2:9000\""));
         assert!(h.contains("name=to value=bbbbbb checked"));
         assert!(h.contains("class='note bad'>nope") && h.contains("value=60"));
+        assert!(!h.contains("without our key"));
+        let g = Gateway {
+            unsigned: (3, *b"610338"),
+            ..g
+        };
+        let mut h = String::new();
+        render_home(&mut h, &s, &n, &g, None, None).unwrap();
+        assert!(h.contains("3 frames without our key, last from 610338"));
     }
 
     #[test]

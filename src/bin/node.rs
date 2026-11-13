@@ -29,9 +29,10 @@ use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNow, EspNowWifiInterface, PeerInf
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use esp_storage::FlashStorage;
 use log::{error, info, warn};
-use sha2::{Digest, Sha256};
 use thermo_feathers::image;
+use thermo_feathers::keys::{self, Creds, Dir};
 use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, MAX_SAMPLES, NodeStatus, UPDATE};
+use thermo_feathers::sha256::Sha256;
 use thermo_feathers::*;
 
 #[path = "../flash.rs"]
@@ -255,6 +256,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     // A new image is on trial until its first reply from the gateway, in this boot: the
     // bootloader abandons it at the next wake otherwise. Only a cold boot can be the first.
     let on_trial = cold && flash::on_trial(&mut flash);
+    let creds = flash::creds(&mut flash);
     info!(
         "fw {}{}",
         core::str::from_utf8(&st.fw).unwrap_or("?"),
@@ -304,7 +306,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let controller =
             WifiController::new(peripherals.WIFI, ControllerConfig::default()).unwrap();
         let mut esp = controller.esp_now();
-        let flags = radio(&mut esp, st, &rtc_us, woke_us).await;
+        let flags = match creds {
+            Some(key) => {
+                let _ = esp.set_pmk(&key.pmk);
+                radio(&mut esp, st, &key, &rtc_us, woke_us).await
+            }
+            None => {
+                warn!("no key in creds: flash this node with scripts/flash-node.sh");
+                None
+            }
+        };
         if flags.is_some() {
             st.panics = 0;
         }
@@ -326,7 +337,10 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             } else {
                 // before, so a crash mid-update backs off too; a good update restarts anyway
                 st.update_skip = UPDATE_BACKOFF_WAKES;
-                let e = update(&mut esp, st, &mut flash).await;
+                let e = match creds {
+                    Some(key) => update(&mut esp, st, &key, &mut flash).await,
+                    None => "no key",
+                };
                 error!("update failed: {e}");
             }
         }
@@ -366,11 +380,12 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 async fn radio(
     esp: &mut EspNow,
     st: &mut State,
+    key: &Creds,
     rtc_us: &impl Fn() -> i64,
     woke_us: i64,
 ) -> Option<u8> {
     if st.gw_channel != 0
-        && let Some(f) = exchange(esp, st, rtc_us, woke_us).await
+        && let Some(f) = exchange(esp, st, key, rtc_us, woke_us).await
     {
         st.sweep_failures = 0;
         st.wakes_to_sweep = 0;
@@ -381,8 +396,8 @@ async fn radio(
         warn!("no gateway; next sweep in {} wakes", st.wakes_to_sweep + 1);
         return None;
     }
-    if sweep(esp, st).await
-        && let Some(f) = exchange(esp, st, rtc_us, woke_us).await
+    if sweep(esp, st, key).await
+        && let Some(f) = exchange(esp, st, key, rtc_us, woke_us).await
     {
         st.sweep_failures = 0;
         st.wakes_to_sweep = 0;
@@ -403,6 +418,7 @@ async fn radio(
 async fn exchange(
     esp: &mut EspNow,
     st: &mut State,
+    key: &Creds,
     rtc_us: &impl Fn() -> i64,
     woke_us: i64,
 ) -> Option<u8> {
@@ -410,13 +426,14 @@ async fn exchange(
         return None;
     }
     while esp.receive().is_some() {}
+    // encrypted from here on: the gateway made us a peer the same way when it said Hello
     if !esp.peer_exists(&st.gw_mac) {
         let _ = esp.add_peer(PeerInfo {
             interface: EspNowWifiInterface::Station,
             peer_address: st.gw_mac,
-            lmk: None,
+            lmk: Some(keys::lmk(&key.node_key)),
             channel: None,
-            encrypt: false,
+            encrypt: true,
         });
     }
     let t0 = Instant::now();
@@ -446,7 +463,8 @@ async fn exchange(
             battery_chip: st.battery_chip,
             fw: st.fw,
         };
-        let len = proto::encode(
+        let len = seal(
+            key,
             &Frame::Data {
                 nonce: st.nonce,
                 status,
@@ -467,7 +485,7 @@ async fn exchange(
                     if r.info.src_address != st.gw_mac {
                         continue;
                     }
-                    if let Some(Frame::Reply(rep)) = proto::decode(r.data())
+                    if let Some(Frame::Reply(rep)) = open(key, r.data())
                         && rep.nonce == st.nonce
                     {
                         return rep;
@@ -521,9 +539,14 @@ async fn exchange(
 
 /// Broadcasts Discover on channels 1–13 and keeps the first gateway that says Hello, on the
 /// channel the Hello names: a gateway on 6 can be overheard on 4 or 5.
-async fn sweep(esp: &mut EspNow, st: &mut State) -> bool {
+async fn sweep(esp: &mut EspNow, st: &mut State, key: &Creds) -> bool {
     let mut buf = [0u8; FRAME_MAX];
-    let len = proto::encode(&Frame::Discover, &mut buf);
+    let len = seal(key, &Frame::Discover, &mut buf);
+    // The Hello comes unencrypted (we can't have the gateway's peer entry before we know who it
+    // is), and an encrypted peer's plaintext may be dropped: forget the old gateway first.
+    if st.gw_channel != 0 && esp.peer_exists(&st.gw_mac) {
+        let _ = esp.remove_peer(&st.gw_mac);
+    }
     for ch in 1..=13u8 {
         if esp.set_channel(ch).is_err() {
             continue;
@@ -539,16 +562,13 @@ async fn sweep(esp: &mut EspNow, st: &mut State) -> bool {
         let hello = with_timeout(HELLO_WAIT, async {
             loop {
                 let r = esp.receive_async().await;
-                if let Some(Frame::Hello { channel }) = proto::decode(r.data()) {
+                if let Some(Frame::Hello { channel }) = open(key, r.data()) {
                     return (r.info.src_address, channel);
                 }
             }
         })
         .await;
         if let Ok((mac, channel)) = hello {
-            if st.gw_channel != 0 && esp.peer_exists(&st.gw_mac) {
-                let _ = esp.remove_peer(&st.gw_mac);
-            }
             st.gw_mac = mac;
             st.gw_channel = channel;
             info!("gateway found on channel {channel} (heard on {ch})");
@@ -597,10 +617,21 @@ fn read_gauge(i2c: &mut I2c<'_, Blocking>, st: &mut State) {
     }
 }
 
+/// `f`, encoded and tagged with our key.
+fn seal(key: &Creds, f: &Frame, buf: &mut [u8; FRAME_MAX]) -> usize {
+    let len = proto::encode(f, buf);
+    keys::seal(&key.node_key, Dir::ToGateway, buf, len)
+}
+
+/// A frame from the gateway, if its tag is right.
+fn open(key: &Creds, b: &[u8]) -> Option<Frame> {
+    proto::decode(keys::open(&key.node_key, Dir::ToNode, b)?)
+}
+
 /// Asks the gateway for the image from `offset`. One try.
-async fn fetch(esp: &mut EspNow, gw: &[u8; 6], offset: u32) -> Option<Frame> {
+async fn fetch(esp: &mut EspNow, gw: &[u8; 6], key: &Creds, offset: u32) -> Option<Frame> {
     let mut buf = [0u8; FRAME_MAX];
-    let len = proto::encode(&Frame::Fetch { offset }, &mut buf);
+    let len = seal(key, &Frame::Fetch { offset }, &mut buf);
     esp.send_async(gw, &buf[..len]).await.ok()?;
     with_timeout(CHUNK_WAIT, async {
         loop {
@@ -608,7 +639,7 @@ async fn fetch(esp: &mut EspNow, gw: &[u8; 6], offset: u32) -> Option<Frame> {
             if r.info.src_address != *gw {
                 continue;
             }
-            if let Some(f @ Frame::Chunk { offset: o, .. }) = proto::decode(r.data())
+            if let Some(f @ Frame::Chunk { offset: o, .. }) = open(key, r.data())
                 && o == offset
             {
                 return f;
@@ -622,7 +653,12 @@ async fn fetch(esp: &mut EspNow, gw: &[u8; 6], offset: u32) -> Option<Frame> {
 /// Fetches the gateway's image into the slot we didn't boot from, checks it, points otadata at
 /// it as New and restarts into it. Returns only if something went wrong, with what; the node
 /// then carries on with the image it has.
-async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &'static str {
+async fn update(
+    esp: &mut EspNow,
+    st: &State,
+    key: &Creds,
+    flash: &mut FlashStorage<'_>,
+) -> &'static str {
     let Some(slot) = flash::spare(flash) else {
         return "can't find the other app slot";
     };
@@ -645,7 +681,7 @@ async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &
             n,
             data,
             ..
-        }) = fetch(esp, &st.gw_mac, offset).await
+        }) = fetch(esp, &st.gw_mac, key, offset).await
         else {
             misses += 1;
             if misses > 20 {
@@ -681,7 +717,7 @@ async fn update(esp: &mut EspNow, st: &State, flash: &mut FlashStorage<'_>) -> &
         }
     }
     let (want_sha, total) = want.unwrap_or_default();
-    let got: [u8; 32] = sha.finalize().into();
+    let got = sha.finalize();
     if got != want_sha {
         return "SHA-256 doesn't match";
     }
