@@ -1,7 +1,13 @@
 # Node registry and node-aware gateway health
 
-Draft for review, 2026-11-13. Addresses review findings 3 (a gateway update counts as healthy
-without hearing from any node) and 6 (spoofed frames fill the symbol table and the page).
+2026-11-13. Addresses review findings 3 (a gateway update counts as healthy without hearing from
+any node) and 6 (spoofed frames fill the symbol table and the page).
+
+**Status (2026-11-16):** built: the trust scheme (per-node keys, tags, ESP-NOW encryption on top,
+with SHA-256 and HMAC in the library rather than sha2) and gateway health with the expected set.
+Replies are also tagged as the answer to the frame they answer (`keys::seal_reply`), closing the
+replay gap noted under Replays. Not built: the registry itself (TFS3, Forget, Allow again), the
+Unprovisioned list and the "allow unsigned" setting; any node with a valid tag is accepted.
 
 ## Today
 

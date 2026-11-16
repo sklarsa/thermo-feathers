@@ -13,8 +13,13 @@ same image.
 (2026-11-10). Milestone 2: node to gateway to QuestDB over ESP-NOW (2026-11-11). Milestone 3:
 gateway off for 60 min, then QuestDB off for 30 min (2026-11-11), with every reading stored
 once and none duplicated. Milestone 4: the gateway's web page (2026-11-12). Milestone 5: nodes
-update over ESP-NOW and roll back an image that fails (2026-11-12). More nodes come once they're
-assembled.
+update over ESP-NOW and roll back an image that fails (2026-11-12). Since then: per-node keys and
+encrypted links (2026-11-13), gateway updates kept only once the nodes report (2026-11-13), and a
+second node (2026-11-16).
+
+Battery, measured on one node's 1200 mAh LiPo: a 60 s wake uses about 0.07 % an hour (about two
+months a charge), 5 s about 1 % an hour (four days). Nearly all of it is wakes, so the time
+between charges grows with the interval. USB charges about 20 % an hour, slowing near full.
 
 ## Bill of materials
 
@@ -43,11 +48,15 @@ gateway. Every ESP-NOW frame is tagged with a key worked out from it and the nod
 link is encrypted with ESP-NOW's own CCMP on top: the gateway ignores what it can't verify. The
 script writes the node's key into its `creds` partition, so a node needs this one USB flash to
 join, and joins by itself once it has it. The gateway's page counts frames that arrive without a
-good key, and names the last node that sent one.
+good key, and names the last node that sent one. A gateway reply is tagged as the answer to the
+frame it answers, so a recorded one can't be played back to a node later.
 
 A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off), so
-the script waits for one to show up: press RESET whenever it's ready. The gateway, already plugged
-in, never shows up anew, so it's never picked. The script also flashes `bootloader/bootloader.bin`,
+the script waits for one to show up: press RESET whenever it's ready. A board new from Adafruit
+runs its factory firmware, which holds the USB port: hold BOOT, press RESET, let go of BOOT, and
+press RESET again once the script is done. The gateway, already plugged
+in, never shows up anew, so it's never picked. A new node looks for the gateway at once, then 1, 2,
+4… wakes apart, so it can take a few minutes to show up on the page. The script also flashes `bootloader/bootloader.bin`,
 ESP-IDF's bootloader with app rollback turned on (`bootloader/build.sh` rebuilds it with Docker).
 espflash's own bootloader can't roll back, so a node needs this one USB flash before it can be
 updated over the air.
@@ -61,7 +70,8 @@ scripts/ota.sh <gateway address> [all | id,id]   # build, then hand the image to
 or upload the `.bin` from `espflash save-image` on the gateway's Settings page. Each node fetches it
 at its next wake (if charging, or above 40 % battery), restarts into it, and keeps it once it hears
 from the gateway. If the new image never gets that far, the bootloader goes back to the old one at
-the next wake, and the gateway's page says the update rolled back. A confirmed image that then
+the next wake, and the gateway's page says the update rolled back. After a failed update a node
+ignores offers for an hour, so a bad one can't drain its battery. A confirmed image that then
 crashes 3 wakes in a row, before reaching the gateway, goes back to the one before it too. A node
 reports its build as `<version>-<6 hex>`, from the image's own SHA-256, so every build is told
 apart.
@@ -86,15 +96,21 @@ Before restarting it notes the nodes it heard in the last 3 wake intervals. The 
 once it reaches WiFi, the time server and QuestDB and has heard from each of those nodes; otherwise
 it restarts after 10 minutes (or 3 wake intervals and a minute, if longer) and the bootloader goes
 back to the old one, whose page names the nodes the update didn't hear. A node that's gone for good
-blocks updates until it's back: upload again once it reports. Like the nodes, a confirmed gateway image
-that crashes 3 times in a row goes back to the one before it.
+blocks updates until it's back: upload again once it reports. With no node active, WiFi and the
+time server are enough.
+
+While on trial the gateway refuses another gateway upload (it would overwrite the image a failed
+trial goes back to), and doesn't tell nodes their readings are stored until QuestDB has acked
+something, so nodes keep their copies; going back waits for QuestDB first, as a restart does. Like
+the nodes, a confirmed gateway image that crashes 3 times in a row, each within 10 minutes of
+starting, goes back to the one before it, once checked intact.
 
 It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address
 in your router so it stays put.
 
 Its web page, at that address, shows each room's latest reading, battery and last-seen time. Its
 Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C, sets
-the nodes' wake interval, and can override the build's QuestDB address and time server; the
+the nodes' wake interval (5–3600 s; nodes switch at their next report), and can override the build's QuestDB address and time server; the
 gateway switches to a new QuestDB address right away, taking along what the old one hadn't stored. Those settings live in the
 gateway's flash. Node and gateway firmware can be uploaded there too.
 

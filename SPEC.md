@@ -107,10 +107,13 @@ after the gateway acks them.
 - **Overflow:** drop the oldest sample and increment `dropped_samples`. (s3-sensors drops the
   newest because its sender reads the head concurrently; this firmware is single-threaded, so
   keeping the newest data is safe.)
-- **Clearing:** remove samples only when the gateway's reply to that frame (matching nonce) says
-  how many it stored. The gateway acks once a sample is in its own PSRAM buffer, not when QuestDB
-  acks it. Anything else keeps the buffer; QuestDB deduplication absorbs resent rows. A gateway
-  reboot loses what QuestDB hadn't acked yet; accepted for v1.
+- **Clearing:** remove samples only when the gateway's reply to that frame says how many it
+  stored. The reply echoes the frame's nonce and is tagged as the answer to that frame's tag, so
+  an old reply can't be replayed. The gateway acks once a sample is in its own PSRAM buffer, not
+  when QuestDB acks it, except while restarting, or on an update's trial before QuestDB has acked
+  anything: then it acks nothing and nodes resend. Anything else keeps the buffer; QuestDB
+  deduplication absorbs resent rows. Planned restarts and a trial's rollback wait up to 30 s for
+  QuestDB first; a crash loses what QuestDB hadn't acked yet, accepted for v1.
 - **Lost on power loss:** RTC memory does not survive a battery disconnect or brownout. Accepted
   for v1.
 
@@ -189,7 +192,7 @@ on timestamp plus device, so resending a batch is always safe.
 | rtc_drift_ppm | LONG | RTC rate error measured at this sync |
 | buffered | LONG | Samples in the node's buffer when it sent |
 | dropped_samples | LONG | Cumulative since power-on |
-| boot_count | LONG | Cumulative wakes since power-on |
+| boot_count | LONG | Wakes since the last restart (power-on, update, watchdog or panic) |
 | reset_reason | LONG | esp-hal SocResetReason of the last restart other than a deep-sleep wake; 255 = firmware panic |
 | battery_chip | LONG | 0 none, 1 MAX17048, 2 LC709203F |
 | channel | LONG | Channel the gateway heard the node on |
@@ -209,23 +212,25 @@ come from the gateway.
 - **Device ID:** the last 3 bytes of the factory MAC as 6 lowercase hex characters (e.g.
   `a1b2c3`). The same string is the device SYMBOL in QuestDB. The full MAC is logged at boot. Same
   firmware image on every node.
-- **Rooms:** never in firmware. A `device_locations` table records where each device is and since
+- **Rooms:** never in node firmware. The gateway keeps each node's name (its Settings page) and
+  writes a `device_locations` row on every rename, recording where each device is and since
   when; queries match readings to rooms with ASOF JOIN, so history stays right when a node moves.
-- **Settings:** every gateway reply carries the wake interval (clamped to 10–3600 s) and a flags
+- **Settings:** every gateway reply carries the wake interval (clamped to 5–3600 s) and a flags
   byte (bit 0: stay awake for an update). Nodes store only the last values received. The gateway's
   own WiFi credentials and QuestDB address are compile-time environment variables.
 
 ## OTA updates
 
-Not built yet (milestone 5 of the v2 design): the gateway holds an uploaded image and sets the
-update flag in its replies; the node stays awake, receives the image in acked chunks over ESP-NOW
-into its inactive slot, verifies the SHA-256, switches slots and reboots.
+Built in milestone 5 of the v2 design: the gateway holds an uploaded image and sets the update
+flag in its replies; the node stays awake, fetches the image chunk by chunk over ESP-NOW into its
+inactive slot, verifies the SHA-256, switches slots and reboots.
 
 - **Battery guard:** only while charging, or above 40 %.
+- **Backoff:** after a failed update, a node ignores offers for an hour.
 - **Rollback:** the new image starts in pending-verify state and marks itself valid only after its
   first acked send. This needs a second-stage bootloader built with
-  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`; prove that with an image that crashes on boot before
-  relying on OTA. Without it, updates stay on USB.
+  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (`bootloader/`), flashed once over USB; an image that
+  crashes on boot was shown to roll back.
 - Every status row carries `fw_version`, so a rollout is visible in QuestDB.
 
 ## Flash layout
@@ -273,7 +278,7 @@ status row.
 | Wake runs too long | Radio part capped at 2 s; force sleep |
 | Sensor missing or failing | Store the sample with SENSOR_FAIL; keep sending status |
 | Gateway unreachable | Keep buffering; sweep with backoff as in [Radio](#radio) |
-| QuestDB unreachable | The gateway buffers in PSRAM and keeps acking nodes |
+| QuestDB unreachable | The gateway buffers in PSRAM and keeps acking nodes (not on an update's trial: see [Buffering](#buffering-and-batching)) |
 | Buffer full | Drop oldest, count in `dropped_samples` |
 | Battery under 20 % | Normal operation; the status rows let a dashboard alert you days ahead |
 | Battery under 10 % | Double the wake interval; skip OTA |
@@ -285,7 +290,8 @@ Diagnostics:
 
 - Logging through esp-println, at INFO by default via `ESP_LOG`. While charging, log every wake.
 - NeoPixel off during normal operation; a debug build may blink it on each send.
-- RTC-memory counters (`boot_count`, `dropped_samples`) reset only on power loss.
+- `dropped_samples` resets only on power loss; `boot_count` on any restart other than a deep
+  sleep wake.
 
 ## Project structure and build
 
@@ -373,27 +379,28 @@ Milestones are in the [v2 design](docs/superpowers/specs/2026-11-10-espnow-gatew
 
 Tests:
 
-- [ ] Host tests pass (see [Project structure and build](#project-structure-and-build))
-- [ ] Unplug the gateway for an hour: no lost or duplicated rows after it returns
-- [ ] Stop QuestDB for a while: the gateway buffers, then catches up with no duplicates
+- [x] Host tests pass (see [Project structure and build](#project-structure-and-build))
+- [x] Unplug the gateway for an hour: no lost or duplicated rows after it returns (2026-11-11)
+- [x] Stop QuestDB for a while: the gateway buffers, then catches up with no duplicates (2026-11-11)
 - [ ] Move the gateway's AP to another channel: nodes find it again
-- [ ] Measure average current over a few wakes with a USB power meter or the battery monitor's
-  charge rate
+- [x] Measure average current over a few wakes with a USB power meter or the battery monitor's
+  charge rate (2026-11-16, from the gauge: see the README)
 - [ ] Self-heating check: compare a node awake for 10 minutes with a sleeping one side by side
 - [ ] Watch `rtc_drift_ppm` over a day with temperature swings
 - [ ] Run a node down to the critical threshold: no radio, red blink, normal operation
   after charging
-- [ ] OTA with a correct image, a wrong SHA-256, and an image that crashes on boot (must roll back)
+- [ ] OTA with a correct image, a wrong SHA-256, and an image that crashes on boot (must roll back);
+  correct and crashing done (2026-11-12)
 - [ ] Remove the battery while running: node recovers cleanly on reconnect
 - [ ] Force a panic: the node sleeps, restarts, and reports `reset_reason` 255
 
 Open questions:
 
-- **RTC memory:** exact `#[ram(...)]` syntax for persistent RTC fast memory in esp-hal 1.2, and how
-  much of it esp-hal itself uses.
-- **OTA rollback:** does espflash's default bootloader have rollback enabled, and how does
-  esp-bootloader-esp-idf mark an image valid?
-- **Reply latency:** does the gateway reply within the node's 50 ms wait while it's also on WiFi?
+- ~~RTC memory syntax~~: `#[esp_hal::ram(unstable(rtc_fast, persistent))]`, for types valid in
+  any bit pattern.
+- ~~OTA rollback~~: espflash's bootloader can't roll back; `bootloader/` builds ESP-IDF's with it
+  on, and the firmware marks itself valid by rewriting its otadata entry.
+- ~~Reply latency~~: yes, at -30 to -50 dBm.
 - **Wake cost on esp-radio:** is there a full PHY calibration on every wake, and can calibration
   data be kept?
 - **Battery monitor:** confirm the MAX17048 revision is powered from the battery like the published
