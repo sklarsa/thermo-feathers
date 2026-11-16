@@ -59,8 +59,11 @@ const LOW_PCT: f32 = 10.0; // the interval doubles below this
 const UPDATE_MIN_PCT: f32 = 40.0; // no firmware update below this unless charging
 const UPDATE_CAP: Duration = Duration::from_secs(180);
 const CHUNK_WAIT: Duration = Duration::from_millis(100);
-/// Wakes to ignore update offers after an update fails, so a broken one can't drain the battery.
-const UPDATE_BACKOFF_WAKES: u16 = 60;
+/// Time to ignore update offers after an update fails, so a broken one can't drain the battery.
+/// Counted in wakes of the interval at the time.
+const UPDATE_BACKOFF_S: u32 = 3600;
+/// Longest a send waits for ESP-NOW's MAC-layer answer.
+const SEND_WAIT: Duration = Duration::from_millis(100);
 const CRITICAL_V: f32 = 3.5; // no radio below this: its current spikes can brown the board out
 const FLASH_WINDOW: Duration = Duration::from_secs(30);
 const REPLY_WAIT: Duration = Duration::from_millis(50);
@@ -187,11 +190,19 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let ring = keep.then(|| unsafe { core::ptr::read(&st.ring) });
         // crashes in a row survive too, so a hang the watchdog ends still counts toward fall_back
         let panics = if keep { st.panics } else { 0 };
+        // and the counters that only a power cut resets, and an update's backoff
+        let (dropped, update_skip) = if keep {
+            (st.dropped_samples, st.update_skip)
+        } else {
+            (0, 0)
+        };
         // ponytail: magic + wake cause, no CRC; a garbled header after a brownout is caught by
         // the reset reason, and SampleRing::fix guards the indexes either way
         // SAFETY: State is valid zeroed
         *st = unsafe { core::mem::zeroed() };
         st.panics = panics;
+        st.dropped_samples = dropped;
+        st.update_skip = update_skip;
         if let Some(r) = ring {
             st.ring = r;
             st.ring.fix();
@@ -224,7 +235,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     // rolls back unconfirmed ones, so go back by hand.
     if st.panics >= PANICS_TO_FALL_BACK {
         st.panics = 0;
-        if flash::fall_back(&mut flash) {
+        if flash::fall_back(&mut flash, image::NODE_PROJECT) {
             esp_hal::system::software_reset();
         }
     }
@@ -336,7 +347,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                 info!("update offered; waiting for charge or {UPDATE_MIN_PCT} %");
             } else {
                 // before, so a crash mid-update backs off too; a good update restarts anyway
-                st.update_skip = UPDATE_BACKOFF_WAKES;
+                st.update_skip = (UPDATE_BACKOFF_S / st.wake_s as u32).max(1) as u16;
                 let e = match creds {
                     Some(key) => update(&mut esp, st, &key, &mut flash).await,
                     None => "no key",
@@ -474,9 +485,10 @@ async fn exchange(
             &mut buf,
         );
 
+        let data_tag = &buf[len - keys::TAG..len];
         let mut reply = None;
         for _ in 0..2 {
-            if esp.send_async(&st.gw_mac, &buf[..len]).await.is_err() {
+            if !send(esp, &st.gw_mac, &buf[..len]).await {
                 continue; // no MAC-layer ack
             }
             reply = with_timeout(REPLY_WAIT, async {
@@ -485,7 +497,8 @@ async fn exchange(
                     if r.info.src_address != st.gw_mac {
                         continue;
                     }
-                    if let Some(Frame::Reply(rep)) = open(key, r.data())
+                    if let Some(Frame::Reply(rep)) =
+                        open_reply(key, r.data(), data_tag).or_else(|| open(key, r.data()))
                         && rep.nonce == st.nonce
                     {
                         return rep;
@@ -552,11 +565,7 @@ async fn sweep(esp: &mut EspNow, st: &mut State, key: &Creds) -> bool {
             continue;
         }
         while esp.receive().is_some() {} // a late Hello from the last channel isn't an answer here
-        if esp
-            .send_async(&BROADCAST_ADDRESS, &buf[..len])
-            .await
-            .is_err()
-        {
+        if !send(esp, &BROADCAST_ADDRESS, &buf[..len]).await {
             continue;
         }
         let hello = with_timeout(HELLO_WAIT, async {
@@ -603,9 +612,14 @@ fn read_gauge(i2c: &mut I2c<'_, Blocking>, st: &mut State) {
             .ok()
             .map(|_| u16::from_be_bytes(b))
     };
-    if let (Some(v), Some(soc), Some(rate)) = (reg(0x02), reg(0x04), reg(0x16)) {
+    let mut read = || Some((reg(0x02)?, reg(0x04)?, reg(0x16)?));
+    if let Some((v, soc, rate)) = read().or_else(read) {
         (st.battery_v, st.battery_pct, st.charge_rate) = max17048(v, soc, rate);
         st.battery_chip = 1;
+    } else if st.battery_chip == 1 && !st.battery_v.is_nan() {
+        // read before, not now: keep the last reading rather than turn the radio on blind at a
+        // voltage that may be critical
+        warn!("battery gauge: read failed, keeping the last reading");
     } else {
         // ponytail: the LC709203F revision is only detected, not read
         st.battery_chip = if i2c.write(LC709203F, &[]).is_ok() {
@@ -615,6 +629,15 @@ fn read_gauge(i2c: &mut I2c<'_, Blocking>, st: &mut State) {
         };
         (st.battery_v, st.battery_pct, st.charge_rate) = (f32::NAN, f32::NAN, f32::NAN);
     }
+}
+
+/// Sends `b` to `to`; whether ESP-NOW says it arrived. Bounded, so a lost send callback can't hold
+/// the wake until the watchdog.
+async fn send(esp: &mut EspNow, to: &[u8; 6], b: &[u8]) -> bool {
+    matches!(
+        with_timeout(SEND_WAIT, esp.send_async(to, b)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// `f`, encoded and tagged with our key.
@@ -628,11 +651,18 @@ fn open(key: &Creds, b: &[u8]) -> Option<Frame> {
     proto::decode(keys::open(&key.node_key, Dir::ToNode, b)?)
 }
 
+/// The gateway's reply to the frame whose tag is `to`, if its tag is right.
+fn open_reply(key: &Creds, b: &[u8], to: &[u8]) -> Option<Frame> {
+    proto::decode(keys::open_reply(&key.node_key, Dir::ToNode, b, to)?)
+}
+
 /// Asks the gateway for the image from `offset`. One try.
 async fn fetch(esp: &mut EspNow, gw: &[u8; 6], key: &Creds, offset: u32) -> Option<Frame> {
     let mut buf = [0u8; FRAME_MAX];
     let len = seal(key, &Frame::Fetch { offset }, &mut buf);
-    esp.send_async(gw, &buf[..len]).await.ok()?;
+    if !send(esp, gw, &buf[..len]).await {
+        return None;
+    }
     with_timeout(CHUNK_WAIT, async {
         loop {
             let r = esp.receive_async().await;
@@ -700,6 +730,9 @@ async fn update(
         // every chunk but the last is full, so chunks never straddle a sector
         if n != CHUNK && offset as usize + n != total as usize {
             return "short chunk";
+        }
+        if offset as usize + n > total as usize {
+            return "chunk past the end";
         }
         let at = offset as usize % SECTOR;
         sector[at..at + n].copy_from_slice(&data[..n]);

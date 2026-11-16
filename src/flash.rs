@@ -133,18 +133,24 @@ fn read_otadata(flash: &mut FlashStorage) -> Option<(u32, [u8; 32], [u8; 32])> {
     Some((at, e0, e1))
 }
 
+/// otadata's current entry, `(which, seq, state)`, if it names the slot we booted from. When the
+/// bootloader couldn't load the new image and fell through to the old one, it doesn't.
+fn current_booted(flash: &mut FlashStorage) -> Option<(u32, usize, u32, u32)> {
+    let b = booted(flash)?;
+    let (at, e0, e1) = read_otadata(flash)?;
+    let (which, seq, state) = otadata::current(&e0, &e1)?;
+    (otadata::slot_of(seq) == b.n).then_some((at, which, seq, state))
+}
+
 /// Whether this boot is a new image's trial: the bootloader marked it pending, and abandons it
 /// at the next boot unless it's confirmed first.
 pub fn on_trial(flash: &mut FlashStorage) -> bool {
-    read_otadata(flash)
-        .and_then(|(_, e0, e1)| otadata::current(&e0, &e1))
-        .is_some_and(|c| c.2 == otadata::PENDING_VERIFY)
+    current_booted(flash).is_some_and(|c| c.3 == otadata::PENDING_VERIFY)
 }
 
 /// Keeps this image: the bootloader won't roll it back.
 pub fn confirm(flash: &mut FlashStorage) {
-    let done = read_otadata(flash).and_then(|(at, e0, e1)| {
-        let (which, seq, _) = otadata::current(&e0, &e1)?;
+    let done = current_booted(flash).and_then(|(at, which, seq, _)| {
         let e = otadata::entry(seq, otadata::VALID);
         flash.write(at + which as u32 * otadata::ENTRY_1, &e).ok()
     });
@@ -164,11 +170,16 @@ pub fn boot_next(flash: &mut FlashStorage, slot: Slot) -> Result<(), &'static st
 }
 
 /// For a confirmed image that keeps crashing: boot the other slot again if otadata still names it
-/// as a good image. Returns whether it did; the caller restarts.
-pub fn fall_back(flash: &mut FlashStorage) -> bool {
+/// as a good image and it's an intact `project` image (a failed update may have half overwritten
+/// it since). Returns whether it did; the caller restarts.
+pub fn fall_back(flash: &mut FlashStorage, project: &str) -> bool {
     let Some(b) = booted(flash) else {
         return false;
     };
+    if let Some(Err(e)) = spare(flash).map(|s| verify(flash, s, project)) {
+        warn!("crashing, and the other slot's image is no good: {e}");
+        return false;
+    }
     let Some((at, e0, e1)) = read_otadata(flash) else {
         return false;
     };

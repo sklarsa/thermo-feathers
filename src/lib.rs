@@ -313,7 +313,9 @@ impl Clock {
 /// interval, capped at an hour of wakes.
 pub fn wakes_to_next_send(send_every: u32, failures: u32, wake_s: u32) -> u32 {
     let cap = (3600 / wake_s.max(1)).max(1);
-    (send_every << failures.min(16)).min(cap.max(send_every))
+    send_every
+        .saturating_mul(1 << failures.min(16))
+        .min(cap.max(send_every))
 }
 
 /// Wakes to skip before the next channel sweep after `failures` failed sweeps in a row: sweeps

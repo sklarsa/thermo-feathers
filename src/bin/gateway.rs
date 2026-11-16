@@ -106,6 +106,11 @@ const RING_BYTES: usize = 1024 * 1024;
 /// Unix µs minus `Instant` µs.
 static OFFSET_US: critical_section::Mutex<Cell<i64>> = critical_section::Mutex::new(Cell::new(0));
 static SYNCED: AtomicBool = AtomicBool::new(false);
+/// This image is on trial: no gateway upload over it, which would overwrite the image it goes
+/// back to.
+static TRIAL: AtomicBool = AtomicBool::new(false);
+/// About to restart: what nodes send now may not reach QuestDB, so it isn't acked.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
 static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
 /// Device IDs, firmware versions and room names. Append-only until a reboot.
 static SYMBOLS: Symbols<128, 24> = Symbols::sized();
@@ -164,8 +169,8 @@ const PANICS_TO_FALL_BACK: u32 = 3;
 static mut EXPECTED: [u8; EXPECTED_LEN] = [0; EXPECTED_LEN];
 
 fn take_expected() -> Option<(Expected, Trial)> {
-    // SAFETY: only touched from the boot path, `restart_when_drained` and `healthy`'s rollback,
-    // each of which is followed by no other.
+    // SAFETY: plain bytes, touched by value from the executor's tasks only: at boot, and before
+    // an update's restart or a trial's rollback (never both: there's no upload on trial).
     let b = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(EXPECTED), [0; EXPECTED_LEN]) };
     Expected::from_bytes(&b)
 }
@@ -247,6 +252,7 @@ async fn main(spawner: Spawner) -> ! {
     let fw = flash::build_id(&mut flash, env!("CARGO_PKG_VERSION"));
     GW_FW.lock(|f| f.set(fw));
     let trial = flash::on_trial(&mut flash);
+    TRIAL.store(trial, Relaxed);
     let expected = match take_expected() {
         Some((e, Trial::Hear)) if trial => e,
         Some((e, Trial::Missed)) if !trial => {
@@ -258,7 +264,7 @@ async fn main(spawner: Spawner) -> ! {
     // A confirmed image that keeps crashing: the bootloader only rolls back unconfirmed ones.
     if !trial && panics() >= PANICS_TO_FALL_BACK {
         set_panics(0);
-        if flash::fall_back(&mut flash) {
+        if flash::fall_back(&mut flash, GATEWAY_PROJECT) {
             esp_hal::system::software_reset();
         }
     }
@@ -338,7 +344,7 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(report(stack, ring).unwrap());
     spawner.spawn(http(stack, ring).unwrap());
-    spawner.spawn(healthy(trial, expected).unwrap());
+    spawner.spawn(healthy(trial, expected, ring).unwrap());
     spawner.spawn(watchdog(mk_static!(Rtc<'static>, rtc)).unwrap());
 
     espnow(esp, ring).await
@@ -358,12 +364,18 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
         // a node flashed without its key, is counted and dropped before it touches anything.
         let key = keys::node_key(&master, &src);
         let Some(frame) = keys::open(&key, Dir::ToGateway, r.data()).and_then(proto::decode) else {
-            if proto::decode(r.data()).is_some() {
+            // ours untagged, or tagged with another master's key
+            let d = r.data();
+            let untagged = d.len().checked_sub(keys::TAG).map_or(d, |n| &d[..n]);
+            if proto::decode(d).is_some() || proto::decode(untagged).is_some() {
                 UNSIGNED.lock(|u| u.set((u.get().0.wrapping_add(1), device_id(&src))));
             }
             continue;
         };
         let lmk = keys::lmk(&key);
+        // a Reply is tagged as the answer to this frame's tag, so it can't be replayed later
+        let tag = &r.data()[r.data().len() - keys::TAG..];
+        let mut reply_to: &[u8] = &[];
         let len = match frame {
             // Not before joining WiFi: until then the radio is scanning, and a node would keep a
             // channel the gateway is about to leave.
@@ -459,9 +471,14 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     "{}: {stored}/{n} samples, buffered {buffered}, rssi {rssi}, ch {channel}",
                     id_str(&id)
                 );
+                reply_to = tag;
+                // On trial before QuestDB has acked anything, or restarting: the node keeps its
+                // copy and sends it again, and QuestDB's dedup drops the repeat.
+                let hold = RESTARTING.load(Relaxed)
+                    || (TRIAL.load(Relaxed) && QWP_STATS.acks.load(Relaxed) == 0);
                 let reply = Reply {
                     nonce,
-                    stored,
+                    stored: if hold { 0 } else { stored },
                     epoch_us: if SYNCED.load(Relaxed) { now_us() } else { 0 },
                     wake_s: UI.lock(|u| u.borrow().0.wake_s),
                     flags: if offer { UPDATE } else { 0 },
@@ -507,7 +524,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             }
             _ => continue, // someone else's ESP-NOW, or ours from a newer version
         };
-        let len = keys::seal(&key, Dir::ToNode, &mut buf, len);
+        let len = keys::seal_reply(&key, Dir::ToNode, &mut buf, len, reply_to);
         if !peers.touch(&mut esp, src, lmk) {
             warn!("peer {}: can't add", id_str(&device_id(&src)));
             continue;
@@ -816,6 +833,7 @@ async fn http(stack: Stack<'static>, ring: Shared) {
 /// Restarts once the ring has reached QuestDB, or after DRAIN: its records are acked to nodes,
 /// which deleted their copies.
 async fn restart_when_drained(ring: Shared) -> ! {
+    RESTARTING.store(true, Relaxed);
     let t0 = Instant::now();
     while ring.lock(|r| r.borrow().len()) > 0 && t0.elapsed() < DRAIN {
         Timer::after_millis(200).await;
@@ -829,12 +847,13 @@ async fn restart_when_drained(ring: Shared) -> ! {
     esp_hal::system::software_reset()
 }
 
-/// Waits for WiFi, the time, a QuestDB ack and, on trial, a `Data` frame from each `expected`
-/// node. Then the panic count starts over, and a new image on trial is kept. One that doesn't get
-/// there within `trial_s` restarts, and the bootloader goes back to the old one, which shows the
-/// nodes that weren't heard.
+/// Waits for WiFi, the time, a QuestDB ack (or nothing to send: no node is about) and, on trial,
+/// a `Data` frame from each `expected` node. Then a new image on trial is kept. One that doesn't
+/// get there within `trial_s` restarts once what it holds has reached QuestDB, and the bootloader
+/// goes back to the old one, which shows the nodes that weren't heard. The panic count starts
+/// over once healthy, or after TRIAL_S up: crashes days apart, in an outage, aren't a crash loop.
 #[embassy_executor::task]
-async fn healthy(trial: bool, expected: Expected) {
+async fn healthy(trial: bool, expected: Expected, ring: Shared) {
     let t0 = Instant::now();
     let limit = trial_s(UI.lock(|u| u.borrow().0.wake_s));
     if trial {
@@ -845,16 +864,23 @@ async fn healthy(trial: bool, expected: Expected) {
     }
     loop {
         let missing = expected.missing(&UI.lock(|u| u.borrow().1));
+        let questdb = QWP_STATS.acks.load(Relaxed) > 0
+            || (expected.ids().is_empty() && ring.lock(|r| r.borrow().len()) == 0);
         if WIFI_CHANNEL.load(Relaxed) != 0
             && SYNCED.load(Relaxed)
-            && QWP_STATS.acks.load(Relaxed) > 0
+            && questdb
             && (!trial || missing.ids().is_empty())
         {
             set_panics(0);
             if trial {
                 with_flash(flash::confirm);
+                TRIAL.store(false, Relaxed);
                 info!("update kept");
             }
+            return;
+        }
+        if !trial && t0.elapsed().as_secs() > TRIAL_S {
+            set_panics(0);
             return;
         }
         if trial && t0.elapsed().as_secs() > limit {
@@ -863,8 +889,7 @@ async fn healthy(trial: bool, expected: Expected) {
                 missing.ids().len()
             );
             put_expected(&missing, Trial::Missed);
-            Timer::after_millis(100).await;
-            esp_hal::system::software_reset();
+            restart_when_drained(ring).await;
         }
         Timer::after_secs(5).await;
     }
@@ -1244,6 +1269,16 @@ async fn self_update(
             false,
         );
     }
+    if TRIAL.load(Relaxed) {
+        // the other slot holds the image a failed trial goes back to
+        return (
+            text(
+                "409 Conflict",
+                "This gateway image is still on trial. Upload again once it's kept or gone back.",
+            ),
+            false,
+        );
+    }
     let Some(img) = IMAGE.lock(|i| {
         let mut i = i.borrow_mut();
         i.rollout = None; // the image space is shared with node rollouts
@@ -1290,7 +1325,7 @@ async fn install(img: &[u8]) -> Result<[u8; 12], &'static str> {
         with_flash(|f| f.write(at, sector))
             .and_then(|r| r.ok())
             .ok_or("flash write")?;
-        Timer::after_millis(1).await; // let ESP-NOW and the network run between sectors
+        Timer::after_millis(10).await; // let ESP-NOW and the network run between sectors
     }
     with_flash(|f| flash::verify(f, slot, GATEWAY_PROJECT)).ok_or("no flash")??;
     with_flash(|f| flash::boot_next(f, slot)).ok_or("no flash")??;

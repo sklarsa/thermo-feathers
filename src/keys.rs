@@ -37,22 +37,34 @@ fn cut(h: [u8; 32]) -> [u8; 16] {
     k
 }
 
-fn tag(key: &[u8; 16], dir: Dir, frame: &[u8]) -> [u8; TAG] {
-    cut(hmac(key, &[&[dir as u8], frame]))
+/// `ctx` is extra, unsent input: a reply's is the tag of the frame it answers, so a recorded
+/// reply can't be replayed to a later request. Empty for everything else.
+fn tag(key: &[u8; 16], dir: Dir, frame: &[u8], ctx: &[u8]) -> [u8; TAG] {
+    cut(hmac(key, &[&[dir as u8], frame, ctx]))
 }
 
 /// Appends the tag to the `len` bytes of frame in `buf`; returns the new length. `buf` needs
 /// TAG bytes of room after the frame.
 pub fn seal(key: &[u8; 16], dir: Dir, buf: &mut [u8], len: usize) -> usize {
-    let t = tag(key, dir, &buf[..len]);
+    seal_reply(key, dir, buf, len, &[])
+}
+
+/// `seal`, for a reply to the frame whose tag is `to`.
+pub fn seal_reply(key: &[u8; 16], dir: Dir, buf: &mut [u8], len: usize, to: &[u8]) -> usize {
+    let t = tag(key, dir, &buf[..len], to);
     buf[len..len + TAG].copy_from_slice(&t);
     len + TAG
 }
 
 /// The frame without its tag, if the tag is right.
 pub fn open<'a>(key: &[u8; 16], dir: Dir, b: &'a [u8]) -> Option<&'a [u8]> {
+    open_reply(key, dir, b, &[])
+}
+
+/// `open`, for a reply to the frame whose tag is `to`.
+pub fn open_reply<'a>(key: &[u8; 16], dir: Dir, b: &'a [u8], to: &[u8]) -> Option<&'a [u8]> {
     let n = b.len().checked_sub(TAG)?;
-    let want = tag(key, dir, &b[..n]);
+    let want = tag(key, dir, &b[..n], to);
     // every byte, so the time taken doesn't say how much of a forged tag was right
     let diff = want.iter().zip(&b[n..]).fold(0, |d, (a, b)| d | (a ^ b));
     (diff == 0).then_some(&b[..n])
@@ -170,6 +182,14 @@ mod tests {
         assert_eq!(open(&k, Dir::ToGateway, &bad[..n]), None);
         assert_eq!(open(&k, Dir::ToGateway, &buf[..n - 1]), None);
         assert_eq!(open(&k, Dir::ToGateway, &buf[..3]), None);
+        // a reply only opens as the reply to the frame it was sealed for
+        let mut r = [0u8; 64];
+        r[..2].copy_from_slice(b"ok");
+        let to = &buf[n - TAG..n];
+        let m = seal_reply(&k, Dir::ToNode, &mut r, 2, to);
+        assert_eq!(open_reply(&k, Dir::ToNode, &r[..m], to), Some(&b"ok"[..]));
+        assert_eq!(open_reply(&k, Dir::ToNode, &r[..m], &[0; TAG]), None);
+        assert_eq!(open(&k, Dir::ToNode, &r[..m]), None);
     }
 
     #[test]
