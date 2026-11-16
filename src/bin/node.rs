@@ -332,6 +332,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         }
         if on_trial && flags.is_some() {
             flash::confirm(&mut flash);
+            st.update_skip = 0; // the update took: the backoff was for a failed one
         }
         st.update_skip = st.update_skip.saturating_sub(1);
         if flags.is_some_and(|f| f & UPDATE != 0) {
