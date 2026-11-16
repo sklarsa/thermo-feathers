@@ -497,8 +497,7 @@ async fn exchange(
                     if r.info.src_address != st.gw_mac {
                         continue;
                     }
-                    if let Some(Frame::Reply(rep)) =
-                        open_reply(key, r.data(), data_tag).or_else(|| open(key, r.data()))
+                    if let Some(Frame::Reply(rep)) = open_reply(key, r.data(), data_tag)
                         && rep.nonce == st.nonce
                     {
                         return rep;
