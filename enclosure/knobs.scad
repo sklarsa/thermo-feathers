@@ -23,6 +23,10 @@ jst_room = 10;      // above the board, for the battery plug and the bend in its
 key_head = 7.5;     // the head goes through here
 key_shank = 3.8;    // and slides up on its shank
 
+// ---- Device ID on the back ----
+id_size = 6;        // cap height, mm
+id_depth = 0.6;     // three layers at 0.2 mm
+
 // ---- SHT41 ----
 sht_back = 0.5;     // air between its back edge and the back wall
 sht_play = 0.3;     // between it and its lips; less if it rattles, more if it won't slide in

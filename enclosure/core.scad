@@ -110,6 +110,11 @@ module keyhole() translate([key_c.x, -1, key_c.y]) rotate([-90, 0, 0]) linear_ex
   translate([0, -6]) circle(d = key_shank, $fn = 24);
 }
 
+// The device ID, cut into the back: it prints on the bed, so it comes out crisp. Reads from behind,
+// below the keyhole.
+module id_label() if (id != "") translate([0, -0.01, bay_z + 2.5]) rotate([90, 0, 0]) mirror([0, 0, 1])
+  linear_extrude(id_depth + 0.01) text(id, size = id_size, font = "Liberation Mono:style=Bold", halign = "center", valign = "center");
+
 // Feather: standoffs from the back wall to its component face. Screws at the USB end, pins at the
 // antenna end, where the holes are unplated and smaller.
 module feather_mounts() {
@@ -158,6 +163,7 @@ module core() {
         usb_cut();
         button_holes();
         keyhole();
+        id_label();
       }
       feather_mounts();
       battery_fins();

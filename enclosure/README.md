@@ -51,7 +51,14 @@ openscad -D 'part="core"' -o enclosure/stl/core.stl enclosure/main.scad
 openscad -D 'part="shell"' -D 'shell="plain"' -D 'colour=1' -o enclosure/stl/shell_plain_c1.stl enclosure/main.scad
 ```
 
-`stl/` has them built. Print the test pieces first; each is cut from the same geometry:
+Give each core its node's device ID (on the gateway's page, or in device_status), cut into the
+back so a node can be told apart after moving rooms:
+
+```sh
+openscad -D 'part="core"' -D 'id="610338"' -o enclosure/stl/core_610338.stl enclosure/main.scad
+```
+
+`stl/` has them built, a core for each node so far and `core.stl` without an ID. Print the test pieces first; each is cut from the same geometry:
 
 | Part | Checks | Knobs (`knobs.scad`) |
 |---|---|---|

@@ -1,6 +1,7 @@
 // thermo-feathers node enclosure. Print in PLA, no supports.
 //
-//   openscad -D 'part="core"' -o enclosure/stl/core.stl enclosure/main.scad      (back down on the bed)
+//   openscad -D 'part="core"' -D 'id="610338"' -o enclosure/stl/core_610338.stl enclosure/main.scad
+//                                                                    (back down on the bed)
 //   openscad -D 'part="shell"' -D 'shell="plain"' -D 'colour=1' -o enclosure/stl/shell_plain_c1.stl enclosure/main.scad
 //
 // A shell is up to four STLs, one per colour, in the same coordinates: load them together as one
@@ -16,6 +17,7 @@
 // part: assembly | exploded | core | core_view | shell | shell_view | hardware | check | check_core
 //       | test_* | palette
 part = "assembly";
+id = "";           // the node's device ID (gateway page, device_status), cut into the core's back
 shell = "plain";
 colour = 0;        // 0: every colour (views); 1-4: just that colour's part
 explode = 40;
