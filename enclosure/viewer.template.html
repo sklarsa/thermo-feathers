@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>thermo-feathers enclosure</title>
+<style>
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #f6f5f1; color: #222; }
+  header { padding: 12px 18px; display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; }
+  #wrap { display: grid; grid-template-columns: 240px 1fr; gap: 0; height: 70vh; border-top: 1px solid #ddd; border-bottom: 1px solid #ddd; }
+  #panel { padding: 12px 16px; overflow: auto; background: #fff; border-right: 1px solid #ddd; }
+  #panel label { display: block; margin: 4px 0; cursor: pointer; }
+  #panel .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  #view { position: relative; }
+  canvas { display: block; }
+  .hint { color: #777; font-size: 12px; margin-top: 10px; }
+  #gallery { padding: 16px 18px; }
+  #gallery figure { margin: 0 0 22px; }
+  #gallery img { max-width: 100%; border: 1px solid #ddd; background: #fff; }
+  figcaption { font-weight: 600; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<header><h1>thermo-feathers node enclosure</h1><span class="hint">Drag to rotate, scroll to zoom, right-drag to pan.</span></header>
+<div id="wrap">
+  <div id="panel">
+    <div><b>Shell</b></div><div id="shells"></div>
+    <div style="margin-top:10px"><b>Inside</b></div><div id="others"></div>
+    <label style="margin-top:10px">Explode <input id="explode" type="range" min="0" max="60" value="0"></label>
+    <label><input id="xray" type="checkbox"> See-through shell</label>
+    <div class="hint">Models are embedded; regenerate with <code>python3 enclosure/render.py</code>.</div>
+  </div>
+  <div id="view"></div>
+</div>
+<div id="gallery"></div>
+<script type="importmap">{"imports": {"three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
+
+const IMAGES = /*IMAGES*/[];
+const MODELS = /*MODELS*/[];
+
+const gal = document.getElementById("gallery");
+for (const im of IMAGES) gal.insertAdjacentHTML("beforeend", `<figure><figcaption>${im.title}</figcaption><img src="${im.src}"></figure>`);
+
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color("#f6f5f1");
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 2000);
+camera.up.set(0, 0, 1);
+camera.position.set(140, 220, 130);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 10, 38);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x777766, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(80, 150, 200); scene.add(sun);
+const grid = new THREE.GridHelper(200, 20, 0xcccccc, 0xe2e2e2); grid.rotation.x = Math.PI / 2; scene.add(grid);
+
+const loader = new STLLoader();
+const b64ToBuf = s => Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer;
+const groups = {};   // group -> [mesh]
+for (const m of MODELS) {
+  const geo = loader.parse(b64ToBuf(m.data)); geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: m.color, roughness: 0.75, metalness: 0.05 }));
+  mesh.userData = m; scene.add(mesh); (groups[m.group] ??= []).push(mesh);
+}
+const shellNames = Object.keys(groups).filter(g => g !== "inside");
+const sw = cs => cs.map(c => `<span class="sw" style="background:${c}"></span>`).join("");
+let current = shellNames[0];
+const show = () => { for (const g of shellNames) for (const m of groups[g]) m.visible = g === current; };
+for (const g of shellNames) document.getElementById("shells").insertAdjacentHTML("beforeend",
+  `<label><input type="radio" name="shell" value="${g}" ${g === current ? "checked" : ""}>${sw(groups[g].map(m => m.userData.color))}${g}</label>`);
+for (const m of groups.inside || []) document.getElementById("others").insertAdjacentHTML("beforeend",
+  `<label><input type="checkbox" data-n="${m.userData.name}" checked>${sw([m.userData.color])}${m.userData.name}</label>`);
+document.querySelectorAll("input[name=shell]").forEach(r => r.onchange = () => { current = r.value; show(); });
+document.querySelectorAll("#others input").forEach(c => c.onchange = () => { for (const m of groups.inside) if (m.userData.name === c.dataset.n) m.visible = c.checked; });
+const shellMeshes = () => shellNames.flatMap(g => groups[g]);
+document.getElementById("explode").oninput = e => { for (const m of shellMeshes()) m.position.y = +e.target.value; };
+document.getElementById("xray").onchange = e => { for (const m of shellMeshes()) { const mt = m.material; mt.transparent = e.target.checked; mt.opacity = e.target.checked ? 0.35 : 1; mt.depthWrite = !e.target.checked; } };
+show();
+
+function resize() { const w = view.clientWidth, h = view.clientHeight; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+addEventListener("resize", resize); resize();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
