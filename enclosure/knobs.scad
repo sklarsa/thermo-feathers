@@ -29,6 +29,9 @@ key_shank = 3.8;    // and slides up on its shank
 id_size = 6;        // cap height, mm
 id_depth = 0.6;     // three layers at 0.2 mm
 
+// ---- Battery ----
+batt_press = 0.5;   // the shell's ribs press into the battery's front this far; more if it still moves
+
 // ---- SHT41 ----
 sht_back = 0.5;     // air between its back edge and the back wall
 sht_play = 0.1;     // between it and its lips; 0.3 rattled. More if it won't slide in

@@ -132,9 +132,13 @@ module feather_mounts() {
 // Battery: fins from the back wall below the board hold it off the board and the cable run; its
 // left edge is the -x wall, a fin stops its right edge, and the roof and bay floor its ends.
 module battery_fins() {
-  for (x = [batt_x + 6, batt_x + batt[1] - 6]) translate([x - 0.8, wall - 0.5, bay_z - 0.01]) cube([1.6, batt_y - wall + 0.5, board_z - 2 - bay_z]);
+  for (x = [batt_x + 10, batt_x + batt[1] - 6])   // the left one clear of the cable slot and the keyhole translate([x - 0.8, wall - 0.5, bay_z - 0.01]) cube([1.6, batt_y - wall + 0.5, board_z - 2 - bay_z]);
   translate([batt_x + batt[1] + 2 * tol, wall - 0.5, bay_z - 0.01]) cube([1.6, core_D - wall + 0.5, board_z - 2 - bay_z]);
 }
+
+// "BATTERY" cut into the bay floor where it stands, read from the front.
+module batt_label() translate([batt_x + batt[1] / 2, batt_y + batt[2] / 2, bay_z - 0.4]) linear_extrude(0.41)
+  text("BATTERY", size = 3.2, font = "Liberation Sans:style=Bold", halign = "center", valign = "center");
 
 // SHT41: slides in from the front on two rails under its short edges, under lips at its two back
 // corners, to the back wall. The front lips are left out: its STEMMA QT sockets sit right at those
@@ -161,7 +165,8 @@ module core() {
         for (x = [-17 : 6 : 17]) translate([x - 1.5, wall + 2, -1]) cube([3, core_D - wall - 4, feet + floor_t + 2]);
         translate([-core_W / 2 + 6, -1, -1]) cube([core_W - 12, core_D + 2, feet + 1]);   // feet: a rail at each end
         // the STEMMA QT cable: down behind the battery, through the bay floor at the back
-        translate([in_x0 + 2, wall - 0.01, pocket_top - 1]) cube([7, 4, bay_z - pocket_top + 2]);
+        translate([in_x0 + 2, wall - 0.01, pocket_top - 1]) cube([7, 5, bay_z - pocket_top + 2]);   // a JST-SH plug is 6 x 4.3
+        batt_label();
         usb_cut();
         button_holes();
         keyhole();

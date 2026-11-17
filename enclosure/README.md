@@ -72,7 +72,7 @@ and an ImageMagick with PNG support.
 
 ## Parts
 
-- 2 × M2.5 × 8 mm pan-head self-tapping screws (the Feather)
+- 2 × M2.5 × 6 mm pan-head self-tapping screws (the Feather); the pins at the antenna end only locate it
 - a STEMMA QT cable of 100 mm (Adafruit 4210); the run is about 85 mm, and a longer one coils
   behind the battery
 - to hang it: a pan-head screw with a head under 7.5 mm and a shank under 3.8 mm
@@ -85,7 +85,7 @@ and an ImageMagick with PNG support.
    back of the bay floor.
 2. Plug the cable into the SHT41's nearer socket, then slide the SHT41 in from the front on its
    rails, sensor up, until it stops at the back wall under its lips.
-3. Stand the battery in front of the board's USB half, its wires at the top.
+3. Stand the battery on the floor where it says BATTERY, in front of the board's USB half, wires at the top. Ribs inside the shell press it onto its fins.
 4. Push the shell on from the front until both tabs click.
 
 ## Shells

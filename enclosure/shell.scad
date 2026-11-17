@@ -69,7 +69,12 @@ module shell_body(rim) {
       offset(delta = -(edge_ch - i * 0.2)) art() union() { children(0); sleeve_outline(); } }
   }
   tab_lips();
+  batt_ribs();
 }
+
+// Ribs on the front plate's inside, over the battery's fins: they press it batt_press onto them.
+module batt_ribs() for (x = [batt_x + 10, batt_x + batt[1] - 6])
+  translate([x - 1, batt_y + batt[2] - batt_press, batt_z + 8]) cube([2, shell_front_y - (batt_y + batt[2]) + batt_press + 0.01, batt[0] - 16]);
 
 // rim: depth of the outline's own edge wall, for parts that stick out past the sleeve
 module shell_build(part = "all", palette = ["#999999", "#dddddd", "#333333", "#cc3333"], rim = 4) {
