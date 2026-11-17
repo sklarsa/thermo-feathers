@@ -47,7 +47,7 @@ if (part == "check") intersection() { the_shell(c = 0); boards(); }
 if (part == "check_core") intersection() { core(); boards(); }
 
 module cut(from, to) intersection() { children(); translate(from) cube(to - from); }
-if (part == "test_feather") core_print() cut([-core_W, -1, board_z - 4], [board_x + fw + 2, board_y + pcb + 3, board_z + fh + 4]) core();
+if (part == "test_feather") core_print() cut([-core_W, -1, board_z - 1.5], [board_x + fw + 2, board_y + pcb + 3, board_z + fh + 4]) core();
 if (part == "test_sensor") core_print() cut([-core_W, -1, -1], [core_W, core_D + 1, bay_z + 0.01]) core();
 if (part == "palette") for (s = shells) echo(str("SHELL|", s[0], "|", s[1], "|", s[2][0], "|", s[2][1], "|", s[2][2], "|", s[2][3]));
 

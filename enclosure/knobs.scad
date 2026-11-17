@@ -15,6 +15,7 @@ shell_clear = 0.3;  // air between the core's outside and a shell's inside
 // ---- Feather: as the s3-sensors box, M2.5 self-tapping screws into printed standoffs ----
 qt_gap = 7;         // back wall to the board's component face: its tallest part, the JST-PH, is 6 mm
 standoff_d = 4.4;   // under the screws: inside the hole pads, clear of the CHG LED
+root_flare = 3;     // extra diameter at a post's root, tapering to nothing 3 mm up: one broke off mid-print
 pin_post_d = 3.2;   // under the pins: clear of the ESP32-S3 module beside them
 m25_pilot = 2.2;    // M2.5 self-tapping pilot; 2.0 if the screw spins, 2.4 if it won't go in
 pin_d = 1.9;        // locating pins in its 2.2 mm holes
@@ -30,7 +31,8 @@ id_depth = 0.6;     // three layers at 0.2 mm
 
 // ---- SHT41 ----
 sht_back = 0.5;     // air between its back edge and the back wall
-sht_play = 0.3;     // between it and its lips; less if it rattles, more if it won't slide in
+sht_play = 0.1;     // between it and its lips; 0.3 rattled. More if it won't slide in
+sht_side = 0.15;    // each side, between it and the rails' inside faces
 sht_lip = 0.8;      // how far the lips reach over its back corners
 
 // ---- Shell snap interface: tabs in the sleeve's side walls click over the core's back edge ----

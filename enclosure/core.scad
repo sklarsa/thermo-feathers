@@ -117,11 +117,13 @@ module id_label() if (id != "") translate([0, -0.01, bay_z + 2.5]) rotate([90, 0
 
 // Feather: standoffs from the back wall to its component face. Screws at the USB end, pins at the
 // antenna end, where the holes are unplated and smaller.
+module root(d) cylinder(d1 = d + root_flare, d2 = d, h = 3.5, $fn = 32);   // from 0.5 inside the wall
 module feather_mounts() {
   for (h = f_screws) let(p = fpos(h)) translate([p.x, wall - 0.5, p.z]) rotate([-90, 0, 0])
-    difference() { cylinder(d = standoff_d, h = qt_gap + 0.5, $fn = 32); translate([0, 0, 1]) cylinder(d = m25_pilot, h = qt_gap, $fn = 24); }
+    difference() { union() { cylinder(d = standoff_d, h = qt_gap + 0.5, $fn = 32); root(standoff_d); } translate([0, 0, 1]) cylinder(d = m25_pilot, h = qt_gap, $fn = 24); }
   for (h = f_pins) let(p = fpos(h)) translate([p.x, wall - 0.5, p.z]) rotate([-90, 0, 0]) {
     cylinder(d = pin_post_d, h = qt_gap + 0.5, $fn = 32);
+    root(pin_post_d);
     cylinder(d = pin_d, h = qt_gap + 0.5 + pcb + 0.8, $fn = 24);
     translate([0, 0, qt_gap + 0.5 + pcb + 0.8]) cylinder(d1 = pin_d, d2 = pin_d - 0.8, h = 0.4, $fn = 24);
   }
@@ -138,7 +140,7 @@ module battery_fins() {
 // corners, to the back wall. The front lips are left out: its STEMMA QT sockets sit right at those
 // edges and would hit them on the way in. The shell's front plate stops it sliding out.
 module sht_holder() for (s = [-1, 1]) {
-  e = sw / 2 + tol;                                       // inside face of the rails
+  e = sw / 2 + sht_side;                                     // inside face of the rails
   translate([s > 0 ? e - 1.2 : -e - 1.6, sht_y, feet]) cube([2.8, core_D - sht_y, sht_z - feet]);   // rail, 1.2 under the board
   translate([s > 0 ? e : -e - 1.6, sht_y, feet]) cube([1.6, s_qt_y[0] - 0.8, sht_z + pcb + sht_play + 1.2 - feet]);   // back post
   translate([s > 0 ? e - sht_lip : -e - 1.6, sht_y, sht_z + pcb + sht_play]) cube([1.6 + sht_lip, s_qt_y[0] - 0.8, 1.2]);  // lip
