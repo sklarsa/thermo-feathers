@@ -112,6 +112,9 @@ static TRIAL: AtomicBool = AtomicBool::new(false);
 /// About to restart: what nodes send now may not reach QuestDB, so it isn't acked.
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
+/// Node frames with a good tag, and replies ESP-NOW couldn't send: gateway_status.
+static FRAMES: AtomicU32 = AtomicU32::new(0);
+static REPLY_FAILS: AtomicU32 = AtomicU32::new(0);
 /// Device IDs, firmware versions and room names. Append-only until a reboot.
 static SYMBOLS: Symbols<128, 24> = Symbols::sized();
 /// The web page's settings, and what each node last sent.
@@ -372,6 +375,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             }
             continue;
         };
+        FRAMES.fetch_add(1, Relaxed);
         let lmk = keys::lmk(&key);
         // a Reply is tagged as the answer to this frame's tag, so it can't be replayed later
         let tag = &r.data()[r.data().len() - keys::TAG..];
@@ -434,6 +438,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     boot_count: status.boot_count,
                     reset_reason: status.reset_reason as u32,
                     battery_chip: status.battery_chip,
+                    link: status.link,
                 });
                 let buffered = status.map_or(0, |s| s.buffered);
                 let seen = Seen {
@@ -530,6 +535,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
             continue;
         }
         if let Err(e) = esp.send_async(&src, &buf[..len]).await {
+            REPLY_FAILS.fetch_add(1, Relaxed);
             warn!("reply to {}: {e:?}", id_str(&device_id(&src)));
         }
     }
@@ -667,7 +673,9 @@ async fn sender(stack: Stack<'static>, ring: Shared, buffers: Buffers<Rec>) {
     .await
 }
 
-/// The address once DHCP binds, then the ring and QWP counters every minute.
+/// The address once DHCP binds, then the ring and QWP counters every minute: in the log, and as a
+/// gateway_status row once there's time. Only while the ring is under half full, so a long
+/// QuestDB outage fills it with node readings, not these.
 #[embassy_executor::task]
 async fn report(stack: Stack<'static>, ring: Shared) {
     stack.wait_config_up().await;
@@ -686,6 +694,36 @@ async fn report(stack: Stack<'static>, ring: Shared) {
             WIFI_CHANNEL.load(Relaxed),
             SYNCED.load(Relaxed)
         );
+        if !SYNCED.load(Relaxed) {
+            continue;
+        }
+        let fw = GW_FW.lock(|f| f.get());
+        let fw_len = fw.iter().position(|&b| b == 0).unwrap_or(12);
+        let Some(fw) = core::str::from_utf8(&fw[..fw_len])
+            .ok()
+            .and_then(intern_spare)
+        else {
+            continue;
+        };
+        let s = GatewayStatus {
+            t_us: now_us(),
+            uptime_s: Instant::now().as_secs() as u32,
+            channel: WIFI_CHANNEL.load(Relaxed) as u8,
+            ring_len: len as u32,
+            ring_dropped: dropped as u32,
+            qwp_acks: QWP_STATS.acks.load(Relaxed),
+            qwp_reconnects: QWP_STATS.reconnects.load(Relaxed),
+            qwp_rejected: QWP_STATS.rejected.load(Relaxed),
+            frames: FRAMES.load(Relaxed),
+            unsigned: UNSIGNED.lock(|u| u.get().0),
+            reply_fails: REPLY_FAILS.load(Relaxed),
+        };
+        ring.lock(|q| {
+            let mut q = q.borrow_mut();
+            if q.len() < q.capacity() / 2 {
+                q.push(Rec::Gateway { fw: fw as u16, s });
+            }
+        });
     }
 }
 

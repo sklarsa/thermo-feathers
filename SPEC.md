@@ -164,7 +164,8 @@ between syncs, and frozen as epoch seconds so resends are identical.
 
 ## Data model and QWP sending
 
-The gateway writes two tables: one row per reading, and one health row per node wake. Device ID
+The gateway writes `room_readings` (one row per reading), `device_status` (one health row per node
+wake) and `gateway_status` (its own, once a minute). Device ID
 and firmware version are SYMBOL columns; everything else is FLOAT or LONG. Both tables deduplicate
 on timestamp plus device, so resending a batch is always safe.
 
@@ -196,6 +197,19 @@ on timestamp plus device, so resending a batch is always safe.
 | reset_reason | LONG | esp-hal SocResetReason of the last restart other than a deep-sleep wake; 255 = firmware panic |
 | battery_chip | LONG | 0 none, 1 MAX17048, 2 LC709203F |
 | channel | LONG | Channel the gateway heard the node on |
+| sends | LONG | Data frames sent, retries included; cumulative since power-on, like the four below |
+| send_fails | LONG | Sends with no ESP-NOW MAC-layer ack |
+| no_replies | LONG | Acked sends the gateway didn't reply to within 50 ms |
+| sweeps | LONG | Searches of channels 1–13 for the gateway |
+| sweep_misses | LONG | Sweeps that didn't find it |
+
+The five link counters ride after a Data frame's samples; the gateway still takes frames without
+them (0s), from nodes that predate them.
+
+`gateway_status`, one row a minute while the gateway has time and its ring is under half full:
+ts, fw_version, uptime_s, channel, ring_len, ring_dropped, qwp_acks, qwp_reconnects, qwp_rejected,
+frames (node frames with a good tag), unsigned (ours without one) and reply_fails. All but the
+first four count since the gateway booted.
 
 Sending, on the gateway:
 
@@ -331,9 +345,17 @@ CREATE TABLE IF NOT EXISTS device_status (
   battery_v FLOAT, battery_pct FLOAT, charge_rate FLOAT,
   rssi_dbm LONG, rtc_drift_ppm LONG,
   buffered LONG, dropped_samples LONG, boot_count LONG,
-  reset_reason LONG, battery_chip LONG, channel LONG
+  reset_reason LONG, battery_chip LONG, channel LONG,
+  sends LONG, send_fails LONG, no_replies LONG, sweeps LONG, sweep_misses LONG
 ) TIMESTAMP(ts) PARTITION BY DAY WAL
 DEDUP UPSERT KEYS(ts, device);
+
+CREATE TABLE IF NOT EXISTS gateway_status (
+  ts TIMESTAMP, fw_version SYMBOL, uptime_s LONG, channel LONG,
+  ring_len LONG, ring_dropped LONG, qwp_acks LONG, qwp_reconnects LONG, qwp_rejected LONG,
+  frames LONG, unsigned LONG, reply_fails LONG
+) TIMESTAMP(ts) PARTITION BY DAY WAL
+DEDUP UPSERT KEYS(ts);
 
 -- Written by hand whenever a node moves
 CREATE TABLE IF NOT EXISTS device_locations (

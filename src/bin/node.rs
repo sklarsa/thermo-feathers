@@ -31,7 +31,9 @@ use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use thermo_feathers::image;
 use thermo_feathers::keys::{self, Creds, Dir};
-use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, MAX_SAMPLES, NodeStatus, UPDATE};
+use thermo_feathers::proto::{
+    self, CHUNK, FRAME_MAX, Frame, Link, MAX_SAMPLES, NodeStatus, UPDATE,
+};
 use thermo_feathers::sha256::Sha256;
 use thermo_feathers::*;
 
@@ -76,6 +78,8 @@ const WATCHDOG: Duration = Duration::from_secs(300);
 /// Bump the low half when State's layout changes. A new MAGIC drops the buffered samples, at the
 /// update and again if it rolls back, and the image that rolls back sits out a flash window.
 const MAGIC: u32 = 0x7EF0_0007;
+/// `State::link` is real only with this beside it: an image from before Link left junk there.
+const LINK_MAGIC: u32 = 0x7EF1_0001;
 /// Crashes in a row, without a reply from the gateway, before a confirmed image gives way to the
 /// one before it.
 const PANICS_TO_FALL_BACK: u8 = 3;
@@ -110,6 +114,9 @@ struct State {
     /// Panics since the gateway last answered.
     panics: u8,
     ring: SampleRing,
+    /// After the ring, so images from before it read the same State: LINK_MAGIC once set.
+    link_magic: u32,
+    link: Link,
 }
 // SAFETY: integers, floats and arrays of them; SampleRing::fix repairs bad indexes.
 unsafe impl esp_hal::Persistable for State {}
@@ -196,6 +203,11 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         } else {
             (0, 0)
         };
+        let link = if keep && st.link_magic == LINK_MAGIC {
+            st.link
+        } else {
+            Link::default()
+        };
         // ponytail: magic + wake cause, no CRC; a garbled header after a brownout is caught by
         // the reset reason, and SampleRing::fix guards the indexes either way
         // SAFETY: State is valid zeroed
@@ -203,6 +215,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         st.panics = panics;
         st.dropped_samples = dropped;
         st.update_skip = update_skip;
+        st.link = link;
+        st.link_magic = LINK_MAGIC;
         if let Some(r) = ring {
             st.ring = r;
             st.ring.fix();
@@ -408,9 +422,12 @@ async fn radio(
         warn!("no gateway; next sweep in {} wakes", st.wakes_to_sweep + 1);
         return None;
     }
-    if sweep(esp, st, key).await
-        && let Some(f) = exchange(esp, st, key, rtc_us, woke_us).await
-    {
+    st.link.sweeps = st.link.sweeps.wrapping_add(1);
+    let found = sweep(esp, st, key).await;
+    if !found {
+        st.link.sweep_misses = st.link.sweep_misses.wrapping_add(1);
+    }
+    if found && let Some(f) = exchange(esp, st, key, rtc_us, woke_us).await {
         st.sweep_failures = 0;
         st.wakes_to_sweep = 0;
         return Some(f);
@@ -474,6 +491,7 @@ async fn exchange(
             reset_reason: st.reset_reason as u8,
             battery_chip: st.battery_chip,
             fw: st.fw,
+            link: st.link,
         };
         let len = seal(
             key,
@@ -489,7 +507,9 @@ async fn exchange(
         let data_tag = &buf[len - keys::TAG..len];
         let mut reply = None;
         for _ in 0..2 {
+            st.link.sends = st.link.sends.wrapping_add(1);
             if !send(esp, &st.gw_mac, &buf[..len]).await {
+                st.link.send_fails = st.link.send_fails.wrapping_add(1);
                 continue; // no MAC-layer ack
             }
             reply = with_timeout(REPLY_WAIT, async {
@@ -510,6 +530,7 @@ async fn exchange(
             if reply.is_some() {
                 break;
             }
+            st.link.no_replies = st.link.no_replies.wrapping_add(1);
         }
         let Some(rep) = reply else {
             warn!("gateway: no reply on channel {}", st.gw_channel);

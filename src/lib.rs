@@ -331,6 +331,7 @@ pub enum Rec {
     Reading { dev: u16, s: Sample },
     Status { dev: u16, fw: u16, s: Status },
     Location { dev: u16, room: u16, t_us: i64 },
+    Gateway { fw: u16, s: GatewayStatus },
 }
 
 /// A node's ID: its MAC's last three bytes in lowercase hex.
@@ -358,9 +359,30 @@ pub struct Status {
     pub boot_count: u32,
     pub reset_reason: u32,
     pub battery_chip: u8,
+    pub link: proto::Link,
 }
 
-/// All three tables. Column types match the tables SPEC.md creates up front.
+/// The gateway's own counters, once a minute: all but the gauges count since it booted.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GatewayStatus {
+    pub t_us: i64,
+    pub uptime_s: u32,
+    pub channel: u8,
+    /// Records waiting for QuestDB, and those the ring has had to drop.
+    pub ring_len: u32,
+    pub ring_dropped: u32,
+    pub qwp_acks: u32,
+    pub qwp_reconnects: u32,
+    pub qwp_rejected: u32,
+    /// Node frames that decoded and had a good tag.
+    pub frames: u32,
+    /// Frames of ours without a good tag.
+    pub unsigned: u32,
+    /// Replies ESP-NOW couldn't send.
+    pub reply_fails: u32,
+}
+
+/// All four tables. Column types match the tables SPEC.md creates up front.
 pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
     use qwp::{FLOAT, LONG, SYMBOL};
     let readings = || {
@@ -413,6 +435,11 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
                 ("boot_count", LONG),
                 ("reset_reason", LONG),
                 ("battery_chip", LONG),
+                ("sends", LONG),
+                ("send_fails", LONG),
+                ("no_replies", LONG),
+                ("sweeps", LONG),
+                ("sweep_misses", LONG),
             ],
         )?;
         e.symbols(status().map(|(d, _, _)| d))?;
@@ -428,6 +455,11 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
         e.i64s(status().map(|(_, _, s)| s.boot_count as i64))?;
         e.i64s(status().map(|(_, _, s)| s.reset_reason as i64))?;
         e.i64s(status().map(|(_, _, s)| s.battery_chip as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.link.sends as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.link.send_fails as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.link.no_replies as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.link.sweeps as i64))?;
+        e.i64s(status().map(|(_, _, s)| s.link.sweep_misses as i64))?;
         e.timestamps(status().map(|(_, _, s)| s.t_us))?;
     }
 
@@ -448,6 +480,50 @@ pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
         e.symbols(moves().map(|(d, _, _)| d))?;
         e.symbols(moves().map(|(_, r, _)| r))?;
         e.timestamps(moves().map(|(_, _, t)| t))?;
+    }
+
+    let gw = || {
+        recs.iter().filter_map(|r| match r {
+            Rec::Gateway { fw, s } => Some((*fw as u64, s)),
+            _ => None,
+        })
+    };
+    let n = gw().count();
+    if n > 0 {
+        e.table(
+            "gateway_status",
+            n,
+            &[
+                ("fw_version", SYMBOL),
+                ("uptime_s", LONG),
+                ("channel", LONG),
+                ("ring_len", LONG),
+                ("ring_dropped", LONG),
+                ("qwp_acks", LONG),
+                ("qwp_reconnects", LONG),
+                ("qwp_rejected", LONG),
+                ("frames", LONG),
+                ("unsigned", LONG),
+                ("reply_fails", LONG),
+            ],
+        )?;
+        e.symbols(gw().map(|(f, _)| f))?;
+        let cols: [fn(&GatewayStatus) -> i64; 10] = [
+            |s| s.uptime_s as i64,
+            |s| s.channel as i64,
+            |s| s.ring_len as i64,
+            |s| s.ring_dropped as i64,
+            |s| s.qwp_acks as i64,
+            |s| s.qwp_reconnects as i64,
+            |s| s.qwp_rejected as i64,
+            |s| s.frames as i64,
+            |s| s.unsigned as i64,
+            |s| s.reply_fails as i64,
+        ];
+        for col in cols {
+            e.i64s(gw().map(|(_, s)| col(s)))?;
+        }
+        e.timestamps(gw().map(|(_, s)| s.t_us))?;
     }
     Ok(())
 }
@@ -681,7 +757,7 @@ mod tests {
 
     #[test]
     fn encodes_both_tables() {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1024];
         let mut e =
             qwp::Encoder::with_symbols(&mut buf, 0, &["a1b2c3", "0.3.0", "d4e5f6"]).unwrap();
         let s = Sample::new(1_800_000_000, 21.0, 40.0, 0);
@@ -705,15 +781,23 @@ mod tests {
                     room: 0,
                     t_us: 1,
                 },
+                Rec::Gateway {
+                    fw: 1,
+                    s: GatewayStatus {
+                        t_us: 1_800_000_000_000_000,
+                        ..Default::default()
+                    },
+                },
             ],
         )
         .unwrap();
         let len = e.finish();
-        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 3);
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 4);
         let has = |n: &[u8]| buf[..len].windows(n.len()).any(|w| w == n);
         assert!(has(b"room_readings") && has(b"device_status") && has(b"fw_version"));
         assert!(has(b"device_locations") && has(b"room") && !has(b"nickname"));
         assert!(has(b"channel") && !has(b"wifi_ms") && !has(b"cached_connect"));
+        assert!(has(b"sweep_misses") && has(b"gateway_status") && has(b"reply_fails"));
     }
 
     #[test]

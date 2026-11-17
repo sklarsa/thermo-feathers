@@ -24,6 +24,8 @@ const HEADER: usize = 3;
 const STATUS_LEN: usize = 48;
 const SAMPLE_LEN: usize = 9;
 const DATA_FIXED: usize = HEADER + 2 + STATUS_LEN + 1;
+/// `Link`, after the samples. Frames from nodes older than it end at the samples.
+const LINK_LEN: usize = 20;
 const REPLY_LEN: usize = HEADER + 2 + 1 + 8 + 2 + 1;
 const FETCH_LEN: usize = HEADER + 4;
 const CHUNK_FIXED: usize = HEADER + 32 + 4 + 4 + 1;
@@ -45,6 +47,21 @@ pub struct NodeStatus {
     pub battery_chip: u8,
     /// Firmware version, NUL-padded.
     pub fw: [u8; 12],
+    pub link: Link,
+}
+
+/// How the node's radio has done, counted since power-on (all 0 from nodes that predate it).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Link {
+    /// Data frames sent, retries included.
+    pub sends: u32,
+    /// Of those, ones ESP-NOW got no MAC-layer ack for.
+    pub send_fails: u32,
+    /// Acked ones the gateway didn't reply to in time.
+    pub no_replies: u32,
+    /// Sweeps of every channel for the gateway, and those that didn't find it.
+    pub sweeps: u32,
+    pub sweep_misses: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -174,6 +191,16 @@ pub fn encode(f: &Frame, out: &mut [u8; FRAME_MAX]) -> usize {
                 w.put(&x.rh_cp.to_le_bytes());
                 w.put(&[x.flags]);
             }
+            let l = &s.link;
+            for x in [
+                l.sends,
+                l.send_fails,
+                l.no_replies,
+                l.sweeps,
+                l.sweep_misses,
+            ] {
+                w.put(&x.to_le_bytes());
+            }
         }
         Frame::Reply(r) => {
             w.put(&r.nonce.to_le_bytes());
@@ -226,17 +253,29 @@ pub fn decode(b: &[u8]) -> Option<Frame> {
                 reset_reason: r.u8(),
                 battery_chip: r.u8(),
                 fw: r.take(),
+                link: Link::default(),
             };
             let n = r.u8();
-            if n as usize > MAX_SAMPLES || b.len() != DATA_FIXED + n as usize * SAMPLE_LEN {
+            let len = DATA_FIXED + n as usize * SAMPLE_LEN;
+            if n as usize > MAX_SAMPLES || (b.len() != len && b.len() != len + LINK_LEN) {
                 return None;
             }
+            let mut status = status;
             let mut samples = [Sample::default(); MAX_SAMPLES];
             for s in &mut samples[..n as usize] {
                 s.ts_s = r.u32();
                 s.temp_cc = r.u16() as i16;
                 s.rh_cp = r.u16();
                 s.flags = r.u8();
+            }
+            if b.len() == len + LINK_LEN {
+                status.link = Link {
+                    sends: r.u32(),
+                    send_fails: r.u32(),
+                    no_replies: r.u32(),
+                    sweeps: r.u32(),
+                    sweep_misses: r.u32(),
+                };
             }
             Some(Frame::Data {
                 nonce,
@@ -328,6 +367,13 @@ mod tests {
             rtc_drift_ppm: -12,
             boot_count: 7,
             fw: *b"0.3.0\0\0\0\0\0\0\0",
+            link: Link {
+                sends: 5,
+                send_fails: 1,
+                no_replies: 2,
+                sweeps: 3,
+                sweep_misses: 4,
+            },
             ..Default::default()
         };
         let f = Frame::Data {
@@ -338,8 +384,15 @@ mod tests {
         };
         let mut b = [0; FRAME_MAX];
         let len = encode(&f, &mut b);
-        assert!(len <= FRAME_MAX);
+        assert!(len + crate::keys::TAG <= FRAME_MAX);
         assert_eq!(decode(&b[..len]), Some(f));
+        // a node from before Link: same frame, minus it
+        let Some(Frame::Data { status: old, .. }) = decode(&b[..len - LINK_LEN]) else {
+            panic!("old-format Data refused");
+        };
+        assert_eq!(old.link, Link::default());
+        assert_eq!(old.boot_count, 7);
+        assert_eq!(decode(&b[..len - 1]), None);
     }
 
     #[test]
@@ -429,9 +482,9 @@ mod tests {
             samples: [Sample::default(); MAX_SAMPLES],
         };
         let n = encode(&empty, &mut d);
-        d[n - 1] = MAX_SAMPLES as u8 + 1; // claims more samples than fit
+        d[DATA_FIXED - 1] = MAX_SAMPLES as u8 + 1; // claims more samples than fit
         assert_eq!(decode(&d[..n]), None);
-        d[n - 1] = 1; // claims a sample that isn't there
+        d[DATA_FIXED - 1] = 1; // claims a sample that isn't there
         assert_eq!(decode(&d[..n]), None);
     }
 }
