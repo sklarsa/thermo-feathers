@@ -6,6 +6,7 @@
 // around 55 °C: keep nodes out of sunny windows.
 //
 // Print the test_* parts (main.scad) before a whole core: each is cut from the same geometry.
+// The snap has no test part: it clicked on the first print. Strain ~0.6 %, 0.5 mm catch, 0.3 mm play.
 
 // ---- Fits ----
 tol = 0.3;          // gap around a board or the battery, from light-show

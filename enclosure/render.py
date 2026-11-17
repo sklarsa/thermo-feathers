@@ -20,7 +20,7 @@ OUT = os.path.join(HERE, "renders")
 TMP = os.path.join(OUT, "tmp")
 STL = os.path.join(HERE, "stl")
 CORE_COLOR = "#3a3d45"
-TESTS = ["test_feather", "test_sensor", "test_snap_c"]   # test_snap_s is per shell, below
+TESTS = ["test_feather", "test_sensor"]
 
 # Views are rendered turned 180 degrees about z (turn=true), so the node's front faces OpenSCAD's
 # front (-y). Cameras are gimbal (translate, rotate, distance): with eye/centre cameras OpenSCAD
@@ -166,7 +166,6 @@ def main():
                 for c in range(1, NCOL[s] + 1):
                     jobs.append(ex.submit(stl, os.path.join(STL, f"shell_{s}_c{c}.stl"), "shell", s, c))     # print, face down
                     jobs.append(ex.submit(stl, os.path.join(TMP, f"shell_{s}_c{c}_view.stl"), "shell_view", s, c))
-                jobs.append(ex.submit(stl, os.path.join(STL, f"test_snap_s_{s}.stl"), "test_snap_s", s, 1))
             [j.result() for j in jobs]
         models = [("inside", "core", CORE_COLOR, os.path.join(TMP, "core_view.stl")),
                   ("inside", "hardware", "#a8a8b2", os.path.join(TMP, "hardware.stl"))]

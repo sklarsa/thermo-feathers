@@ -10,7 +10,6 @@
 // Print the test_* parts first, each cut from the same geometry, then tune knobs.scad and reprint:
 //   test_feather   back wall: standoffs, pins, button holes, and the -x wall's USB opening
 //   test_sensor    the bottom of the core: SHT41 rails and lips, thermal break, bay floor
-//   test_snap_c, test_snap_s   one side's snap: the core's back edge and the shell's tab
 //
 // check, check_core: boards intersected with the shell or the core; empty when nothing collides.
 //
@@ -50,8 +49,6 @@ if (part == "check_core") intersection() { core(); boards(); }
 module cut(from, to) intersection() { children(); translate(from) cube(to - from); }
 if (part == "test_feather") core_print() cut([-core_W, -1, board_z - 4], [board_x + fw + 2, board_y + pcb + 3, board_z + fh + 4]) core();
 if (part == "test_sensor") core_print() cut([-core_W, -1, -1], [core_W, core_D + 1, bay_z + 0.01]) core();
-if (part == "test_snap_c") core_print() cut([core_W / 2 - 6, -1, tab_z - 9], [core_W, core_D + 1, tab_z + 9]) core();
-if (part == "test_snap_s") shell_print() cut([core_W / 2 - 6, -5, tab_z - 9], [core_W, 60, tab_z + 9]) the_shell(c = 1);
 if (part == "palette") for (s = shells) echo(str("SHELL|", s[0], "|", s[1], "|", s[2][0], "|", s[2][1], "|", s[2][2], "|", s[2][3]));
 
 // Section through the snap tabs, seen from above. OpenCSG paints every cut face one colour, so

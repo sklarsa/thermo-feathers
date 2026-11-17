@@ -30,7 +30,7 @@ on a screw.
   on average with ESP-NOW (~0.01 °C). Readings while charging run warm in any case; the firmware
   flags them CHARGING.
 - **Nothing covers the antenna.** The ESP32-S3 module's antenna is at the Feather's far end. The
-  battery stands in front of the USB half only and clears it by 7 mm: a LiPo's foil laid across
+  battery stands in front of the USB half only and clears it by 9.5 mm: a LiPo's foil laid across
   the whole board, as in the first concept, sits between the antenna and the room.
 - **Fixings as on the s3-sensors box** (homelab `esp32/enclosure.scad`): two M2.5 self-tapping
   screws through the Feather's plated holes into printed standoffs, pins in its smaller unplated
@@ -64,7 +64,6 @@ openscad -D 'part="core"' -D 'id="610338"' -o enclosure/stl/core_610338.stl encl
 |---|---|---|
 | `test_feather` | Feather on its standoffs and pins, screws biting, USB plug in, buttons by paperclip | `m25_pilot`, `pin_d`, `qt_gap` |
 | `test_sensor` | SHT41 slides in under its lips and sits still | `sht_play`, `sht_lip` |
-| `test_snap_c` + `test_snap_s_plain` | the shell's tab clicks over the core's edge | `snap_lip`, `snap_arm` |
 
 `part="check_core"` and `part="check"` intersect the boards with the core or the shell: both
 should come out empty, apart from faces that touch on purpose (standoffs, battery fins).
