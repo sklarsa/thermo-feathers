@@ -132,7 +132,8 @@ module feather_mounts() {
 // Battery: fins from the back wall below the board hold it off the board and the cable run; its
 // left edge is the -x wall, a fin stops its right edge, and the roof and bay floor its ends.
 module battery_fins() {
-  for (x = [batt_x + 10, batt_x + batt[1] - 6])   // the left one clear of the cable slot and the keyhole translate([x - 0.8, wall - 0.5, bay_z - 0.01]) cube([1.6, batt_y - wall + 0.5, board_z - 2 - bay_z]);
+  // the left one clear of the cable slot and the keyhole
+  for (x = [batt_x + 10, batt_x + batt[1] - 6]) translate([x - 0.8, wall - 0.5, bay_z - 0.01]) cube([1.6, batt_y - wall + 0.5, board_z - 2 - bay_z]);
   translate([batt_x + batt[1] + 2 * tol, wall - 0.5, bay_z - 0.01]) cube([1.6, core_D - wall + 0.5, board_z - 2 - bay_z]);
 }
 
