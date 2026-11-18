@@ -9,7 +9,7 @@
 //! Feather ESP32-S3 room node. Each wake reads the SHT41 into a ring in RTC memory, sends what the
 //! gateway hasn't stored yet over ESP-NOW, takes the time and wake interval from its reply, and
 //! deep-sleeps. A reply can also ask it to fetch new firmware from the gateway (milestone 5). See
-//! docs/superpowers/specs/2026-11-10-espnow-gateway-design.md.
+//! docs/v2-design.md.
 
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;

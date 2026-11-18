@@ -1,7 +1,7 @@
 # thermo-feathers v2: ESP-NOW nodes and a headless gateway
 
-Status: design, 2026-11-10. This replaces the WiFi, SNTP, cached-lease, manifest and OTA-over-HTTP
-parts of [SPEC.md](../../../SPEC.md). Whatever this document doesn't mention (sensor reading,
+Design of 2026-11-10; milestones 1–5 are built (see the README's status). This replaces the WiFi, SNTP, cached-lease, manifest and OTA-over-HTTP
+parts of [SPEC.md](../SPEC.md). Whatever this document doesn't mention (sensor reading,
 validation, sample flags, battery gauge, low-battery behaviour, the QuestDB tables) stays as
 SPEC.md has it.
 
@@ -223,15 +223,6 @@ and the same crate, so treat a stall as a known risk:
 - Its serial log and `qwp-embedded`'s `Stats` should make one visible.
 - If the gateway stalls, debug it then. Don't block milestones on it.
 
-## Known problem to fix first
-
-Milestone 2 never confirmed that the board wakes from deep sleep:
-- The first cold-boot send reached QuestDB at 01:27 UTC on 2026-11-10.
-- The next send, 10 wakes later, never arrived.
-
-The node can't work on any transport until that's understood. Start by getting a serial log of a
-timer wake. The 30 s window gives a chance to attach.
-
 ## Milestones
 
 1. **Deep-sleep wakes proven** on the current node firmware, ESP-NOW or not.
@@ -265,7 +256,7 @@ soldering, one part.
 $14.95), on a STEMMA QT cable from the gateway's port (I2C0, SDA GPIO3, SCL GPIO4, GPIO7 high to
 power the port). I²C address 0x30. It runs on 3.3 V; greens and blues are dimmer than at 5 V.
 
-**Layouts**, chosen on the web page, mocked up live in `.superpowers/brainstorm/` on 2026-11-10:
+**Layouts**, chosen on the web page, mocked up on 2026-11-10:
 - **D (default): tiny letters, still.** Room initial and temperature in a 3×5 font (`O76`), a
   humidity bar along the bottom two rows (length = % RH), 3 s per room.
 - **A: full line, scrolling.** `Office 76° 41%` in a 5×7 font, about 5 s per room at 20 columns/s.

@@ -9,7 +9,7 @@
 //! Feather ESP32-S3 gateway, on wall power. A WiFi station that also listens on ESP-NOW: nodes'
 //! frames go into a PSRAM ring, which qwp-embedded streams to QuestDB. Each frame is acked to its
 //! node once it's in the ring, with the time and the wake interval. Serves the web page on port 80.
-//! See docs/superpowers/specs/2026-11-10-espnow-gateway-design.md.
+//! See docs/v2-design.md.
 
 use core::cell::{Cell, RefCell};
 use core::mem::MaybeUninit;

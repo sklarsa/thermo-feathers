@@ -8,7 +8,7 @@ wall-powered gateway Feather, which forwards them to [QuestDB](https://questdb.c
 same image.
 
 [SPEC.md](SPEC.md) is the spec; the
-[v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) explains the move to ESP-NOW.
+[v2 design](docs/v2-design.md) explains the move to ESP-NOW.
 
 **Status:** three nodes running. Done:
 
@@ -33,91 +33,104 @@ Per node. Everything is from Adafruit and plugs together, no soldering.
 | 1 | [ESP32-S3 Feather, 4 MB flash / 2 MB PSRAM](https://www.adafruit.com/product/5477) | 5477 | Has the MAX17048 battery gauge on board |
 | 1 | [SHT41 temperature and humidity sensor, STEMMA QT](https://www.adafruit.com/product/5776) | 5776 | |
 | 1 | STEMMA QT cable, 100 mm ([4210](https://www.adafruit.com/product/4210)) | | The enclosure's run is about 85 mm; longer coils behind the battery |
-| 2 | M2.5 × 8 mm pan-head self-tapping screws | | The Feather, in the enclosure |
-| 1 | [LiPo 3.7 V 1200 mAh](https://www.adafruit.com/product/258) | 258 | Battery operation, from milestone 2 |
+| 2 | M2.5 × 6 mm pan-head self-tapping screws | | Hold the Feather in the enclosure |
+| 1 | [LiPo 3.7 V 1200 mAh](https://www.adafruit.com/product/258) | 258 | |
 | 1 | USB-C cable and 5 V USB power supply | | Flashing, charging, and plugged-in running |
 
-The enclosure is in [enclosure/](enclosure/README.md): designed, not printed yet. Pins and power
-rules are in [SPEC.md](SPEC.md#hardware).
+The enclosure is in [enclosure/](enclosure/README.md). Pins and power rules are in
+[SPEC.md](SPEC.md#hardware).
 
 ## Build and flash
 
-Same toolchain as s3-sensors: `espup install --targets esp32s3`, source `~/export-esp.sh`, then
+Same toolchain as s3-sensors: `espup install --targets esp32s3`, then source `~/export-esp.sh`.
+
+`THERMO_MASTER` is a secret of 64 hex digits (`openssl rand -hex 32`, once), shared by every node
+build and the gateway. Each node gets its own key from it and its MAC. Every ESP-NOW frame is
+tagged with that key and encrypted with ESP-NOW's CCMP, and the gateway ignores frames it can't
+verify. Its page counts them and names the last node that sent one. Replies are tagged as answers
+to the frame they answer, so a recorded one can't be replayed.
+
+### A new node
 
 ```sh
 THERMO_MASTER=... scripts/flash-node.sh   # Linux: builds, then flashes the next board on USB
 ```
 
-`THERMO_MASTER` is 64 hex digits (`openssl rand -hex 32`, once), kept secret and the same for the
-gateway. Every ESP-NOW frame is tagged with a key worked out from it and the node's MAC, and the
-link is encrypted with ESP-NOW's own CCMP on top: the gateway ignores what it can't verify. The
-script writes the node's key into its `creds` partition, so a node needs this one USB flash to
-join, and joins by itself once it has it. The gateway's page counts frames that arrive without a
-good key, and names the last node that sent one. A gateway reply is tagged as the answer to the
-frame it answers, so a recorded one can't be played back to a node later.
+The script writes the node's key into its `creds` partition and flashes `bootloader/bootloader.bin`,
+ESP-IDF's bootloader with rollback on (`bootloader/build.sh` rebuilds it with Docker; espflash's
+own can't roll back). That USB flash is the only one a node needs: it then joins by itself and
+updates over the air.
 
-A node is only reachable over USB for 30 s after power-on or RESET (deep sleep turns USB off), so
-the script waits for one to show up: press RESET whenever it's ready. A board new from Adafruit
-runs its factory firmware, which holds the USB port: hold BOOT, press RESET, let go of BOOT, and
-press RESET again once the script is done. The gateway, already plugged
-in, never shows up anew, so it's never picked. A new node looks for the gateway at once, then 1, 2,
-4… wakes apart, so it can take a few minutes to show up on the page. The script also flashes `bootloader/bootloader.bin`,
-ESP-IDF's bootloader with app rollback turned on (`bootloader/build.sh` rebuilds it with Docker).
-espflash's own bootloader can't roll back, so a node needs this one USB flash before it can be
-updated over the air.
+- A node is on USB only for 30 s after power-on or RESET, since deep sleep turns USB off. The
+  script waits for a new board to appear: press RESET whenever it's ready.
+- A board new from Adafruit runs its factory firmware, which holds the USB port: hold BOOT, press
+  RESET, let go of BOOT, and press RESET again once the script is done.
+- The gateway, already plugged in, never appears anew, so the script never picks it.
+- A new node looks for the gateway at once, then 1, 2, 4… wakes apart, so it can take a few
+  minutes to show up on the gateway's page.
 
-After that, update nodes through the gateway:
+### Updating nodes
 
 ```sh
-scripts/ota.sh <gateway address> [all | id,id]   # build, then hand the image to the gateway
+scripts/ota.sh <gateway address> [all | id,id]   # builds, then hands the image to the gateway
 ```
 
-or upload the `.bin` from `espflash save-image` on the gateway's Settings page. Each node fetches it
-at its next wake (if charging, or above 40 % battery), restarts into it, and keeps it once it hears
-from the gateway. If the new image never gets that far, the bootloader goes back to the old one at
-the next wake, and the gateway's page says the update rolled back. After a failed update a node
-ignores offers for an hour, so a bad one can't drain its battery. A confirmed image that then
-crashes 3 wakes in a row, before reaching the gateway, goes back to the one before it too. A node
-reports its build as `<version>-<6 hex>`, from the image's own SHA-256, so every build is told
-apart.
+Or upload the `.bin` from `espflash save-image` on the gateway's Settings page.
 
-The gateway is any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's
-the only device on WiFi, so it's the only build that needs credentials:
+- Each node fetches the image at its next wake, if charging or above 40 % battery, restarts into
+  it, and keeps it once it hears from the gateway.
+- If the new image never gets that far, the bootloader goes back to the old one at the next wake,
+  and the gateway's page says the update rolled back. The node then ignores offers for an hour,
+  so a bad image can't drain its battery.
+- A kept image that later crashes 3 wakes in a row, before reaching the gateway, also goes back.
+- A node reports its build as `<version>-<6 hex>`, from the image's SHA-256, so every build is
+  told apart.
+
+### The gateway
+
+Any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It's the only device
+on WiFi, so it's the only build that needs credentials:
 
 ```sh
 WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 THERMO_MASTER=... \
     cargo run --release --bin gateway
 ```
 
-`cargo run` flashes the rollback bootloader too. After that first USB flash, the gateway updates
-over the network, with the same variables set:
+`cargo run` flashes the rollback bootloader too. The gateway logs its IP address and WiFi channel
+over USB serial once connected; reserve that address in your router.
+
+After the first USB flash it updates over the network, with the same variables set:
 
 ```sh
 scripts/ota.sh <gateway address> gateway
 ```
 
-It writes the image to its other slot and restarts into it once QuestDB has everything it holds.
-Before restarting it notes the nodes it heard in the last 3 wake intervals. The new image is kept
-once it reaches WiFi, the time server and QuestDB and has heard from each of those nodes; otherwise
-it restarts after 10 minutes (or 3 wake intervals and a minute, if longer) and the bootloader goes
-back to the old one, whose page names the nodes the update didn't hear. A node that's gone for good
-blocks updates until it's back: upload again once it reports. With no node active, WiFi and the
-time server are enough.
+- It writes the image to its other slot, waits until QuestDB has everything it holds, notes the
+  nodes it heard in the last 3 wake intervals, and restarts into the new image.
+- The new image is kept once it reaches WiFi, the time server and QuestDB, and has heard from each
+  of those nodes. With no node active, WiFi and the time server are enough.
+- Otherwise it restarts after 10 minutes (or 3 wake intervals and a minute, if longer) and the
+  bootloader goes back to the old image, whose page names the nodes the update didn't hear. A node
+  that's gone for good blocks updates until it's back: upload again once it reports.
+- While on trial it refuses another gateway upload, since that would overwrite the image a failed
+  trial goes back to. It also doesn't tell nodes their readings are stored until QuestDB has acked
+  something, so nodes keep their copies. Going back waits for QuestDB first, as a restart does.
+- A kept gateway image that crashes 3 times in a row, each within 10 minutes of starting, goes back
+  to the one before it, once that one checks out intact.
 
-While on trial the gateway refuses another gateway upload (it would overwrite the image a failed
-trial goes back to), and doesn't tell nodes their readings are stored until QuestDB has acked
-something, so nodes keep their copies; going back waits for QuestDB first, as a restart does. Like
-the nodes, a confirmed gateway image that crashes 3 times in a row, each within 10 minutes of
-starting, goes back to the one before it, once checked intact.
+### The web page
 
-It logs its IP address and WiFi channel over USB serial once it's connected. Reserve that address
-in your router so it stays put.
+At the gateway's address: each room's latest reading, battery and last-seen time. Its Settings
+page:
 
-Its web page, at that address, shows each room's latest reading, battery and last-seen time. Its
-Settings page renames nodes (each rename is also a `device_locations` row), switches °F/°C, sets
-the nodes' wake interval (5–3600 s; nodes switch at their next report), and can override the build's QuestDB address and time server; the
-gateway switches to a new QuestDB address right away, taking along what the old one hadn't stored. Those settings live in the
-gateway's flash. Node and gateway firmware can be uploaded there too.
+- renames nodes (each rename is also a `device_locations` row)
+- switches °F/°C
+- sets the nodes' wake interval, 5–3600 s; nodes switch at their next report
+- overrides the build's QuestDB address and time server. A new QuestDB address takes effect at
+  once, taking along what the old one hadn't stored.
+- uploads node and gateway firmware
+
+The settings live in the gateway's flash.
 
 ## Host tests
 
@@ -138,9 +151,9 @@ rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp
 
 Beyond the ones in [SPEC.md](SPEC.md#open-questions):
 
-- Enclosure: designed ([enclosure/](enclosure/README.md)), not printed or measured. Self-heating
-  inside it is the side-by-side check's main error. Only the plain shell exists; whimsical ones
-  can come later.
+- Enclosure ([enclosure/](enclosure/README.md)): a first core and shell printed (2026-11-17);
+  the fixes from them (post roots, sensor fit, cable slot, battery ribs) aren't printed yet.
+  Self-heating inside it is the side-by-side check's main error. Only the plain shell exists.
 
 ## License
 

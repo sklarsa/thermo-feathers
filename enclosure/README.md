@@ -58,7 +58,10 @@ back so a node can be told apart after moving rooms:
 openscad -D 'part="core"' -D 'id="610338"' -o enclosure/stl/core_610338.stl enclosure/main.scad
 ```
 
-`stl/` has them built, a core for each node so far and `core.stl` without an ID. Print the test pieces first; each is cut from the same geometry:
+`stl/` has them built: a core for each node so far, and `core.stl` without an ID.
+
+After changing a fit, print its test piece rather than a whole core. Each is cut from the same
+geometry:
 
 | Part | Checks | Knobs (`knobs.scad`) |
 |---|---|---|
@@ -96,5 +99,8 @@ is the only one so far. Its holes must open over the sensor pocket.
 
 ## Not done yet
 
-- Nothing printed: every number is from Adafruit's board files, not calipers.
+- First core, shell and test pieces printed 2026-11-17. Fixed since, not yet printed: flared post
+  roots (one broke off mid-print), a snugger SHT41, a cable slot the battery fin no longer
+  blocks, the shell's battery ribs and the BATTERY label.
+- Other numbers are still from Adafruit's board files, not calipers.
 - More shells.

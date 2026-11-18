@@ -8,7 +8,7 @@ Each node is a battery-powered ESP32-S3 that wakes every 60 s to read temperatur
 buffers readings in RTC memory, and sends them over ESP-NOW to a wall-powered gateway Feather. The
 gateway is the only device on WiFi; it forwards everything to QuestDB over QWP. All nodes run one
 identical firmware image; identity, room and settings live outside the binary. The
-[v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) has the reasoning and the
+[v2 design](docs/v2-design.md) has the reasoning and the
 gateway's web page.
 
 Goals:
@@ -33,7 +33,10 @@ the battery connector.
 | MAX17048 (on the Feather) | built in | Battery voltage and % | 0x36 |
 | SHT41 | 5776 | Temperature and humidity | 0x44 |
 | LiPo 3.7 V 1200 mAh | 258 | Power | n/a |
-| STEMMA QT cable 200–400 mm | 4401 / 5384 / 5385 | Keeps the sensor away from board heat | n/a |
+| STEMMA QT cable 100 mm | 4210 | Runs down to the sensor, below the board in the enclosure | n/a |
+
+The enclosure ([enclosure/](enclosure/README.md)) puts the SHT41 below everything that makes heat,
+with a vented gap between them; two M2.5 screws hold the Feather.
 
 Pin and power rules:
 
@@ -62,14 +65,13 @@ The node spends nearly all its time in deep sleep. Every wake (60 s by default; 
 the interval in each reply) it reads the sensor, sends everything unacked over ESP-NOW, and sleeps
 again. A send is a few milliseconds of radio, so there is no separate send interval.
 
-The radio part of a wake is capped at 2 s. Battery life is an estimate until measured: see the
-tests below.
+The radio part of a wake is capped at 2 s. Measured battery life is in the README.
 
 ## Sensor readings
 
 One SHT41 measurement and one battery read per wake.
 
-- **SHT41:** small raw I²C driver, or an embedded-hal 1.0 crate. Send command 0xFD (high
+- **SHT41:** a small raw I²C driver in the node. Send command 0xFD (high
   precision, heater off, since the heater warms the reading), wait at least 10 ms, read 6 bytes,
   and check both CRC-8 bytes (polynomial 0x31, init 0xFF). Convert with
   T = −45 + 175 · raw / 65535 and RH = −6 + 125 · raw / 65535, clamped to 0–100.
@@ -91,8 +93,8 @@ Readings live in a ring buffer in RTC fast memory that survives deep sleep and i
 after the gateway acks them.
 
 - **Storage:** RTC fast memory, not PSRAM. PSRAM and main SRAM lose their contents in deep sleep,
-  so the PSRAM ring from s3-sensors doesn't carry over. Place the ring with esp-hal's `#[ram(...)]`
-  attribute using its RTC-fast persistent option (check the exact syntax for esp-hal 1.2).
+  so the PSRAM ring from s3-sensors doesn't carry over. The ring is placed with
+  `#[esp_hal::ram(unstable(rtc_fast, persistent))]`, which takes types valid in any bit pattern.
 - **Size:** 256 samples, each packed into 12 bytes: `u32 ts_s`, `i16 temp_cC` (centi-°C),
   `u16 rh_cP` (centi-%), `u8 flags`, 3 bytes padding. About 3 KB of the 8 KB of RTC fast memory.
 - **Timestamps are frozen once.** Normally `ts_s` is epoch seconds (a u32 lasts until 2106),
@@ -165,9 +167,9 @@ between syncs, and frozen as epoch seconds so resends are identical.
 ## Data model and QWP sending
 
 The gateway writes `room_readings` (one row per reading), `device_status` (one health row per node
-wake) and `gateway_status` (its own, once a minute). Device ID
-and firmware version are SYMBOL columns; everything else is FLOAT or LONG. Both tables deduplicate
-on timestamp plus device, so resending a batch is always safe.
+wake) and `gateway_status` (its own, once a minute). Device ID and firmware version are SYMBOL
+columns; everything else is FLOAT or LONG. The node tables deduplicate on timestamp plus device,
+`gateway_status` on timestamp, so resending a batch is always safe.
 
 `room_readings`, one row per sample:
 
@@ -231,7 +233,8 @@ come from the gateway.
   when; queries match readings to rooms with ASOF JOIN, so history stays right when a node moves.
 - **Settings:** every gateway reply carries the wake interval (clamped to 5–3600 s) and a flags
   byte (bit 0: stay awake for an update). Nodes store only the last values received. The gateway's
-  own WiFi credentials and QuestDB address are compile-time environment variables.
+  WiFi credentials are compile-time environment variables; its QuestDB address and time server
+  are too, overridable on its Settings page.
 
 ## OTA updates
 
@@ -249,15 +252,14 @@ inactive slot, verifies the SHA-256, switches slots and reboots.
 
 ## Flash layout
 
-The 4 MB flash holds the bootloader, two app slots for OTA, and three small data partitions that
-nothing uses yet:
+The 4 MB flash holds the bootloader, two app slots for OTA, and three small data partitions:
 
 | Offset | Size | Name | What it holds | Who writes it |
 |---|---|---|---|---|
 | 0x0000 | 32 KB | bootloader | ESP-IDF second-stage bootloader, with rollback enabled | First USB flash only |
 | 0x8000 | 4 KB | partition table | This table | First USB flash only |
-| 0x9000 | 4 KB | creds | Unused; was for v1's WiFi credentials | Nothing |
-| 0xA000 | 8 KB | settings | Unused; settings now come from the gateway | Nothing |
+| 0x9000 | 4 KB | creds | Node: its ESP-NOW key (`src/keys.rs`) | `scripts/flash-node.sh` |
+| 0xA000 | 8 KB | settings | Gateway: node names, unit, wake interval, address overrides | The gateway's Settings page |
 | 0xC000 | 8 KB | otadata | Which app slot to boot, and its verify state | Firmware during OTA, bootloader on rollback |
 | 0xE000 | 8 KB | (free) | Padding up to the 64 KB alignment app slots need | n/a |
 | 0x10000 | 1,984 KB | ota_0 | App image, slot A | First flash, then OTA |
@@ -319,6 +321,12 @@ thermo-feathers/
     lib.rs             host-testable: ring buffer, sample packing, clock sync and rate
                        correction, backoff, QWP record encoding
     proto.rs           ESP-NOW frame formats and reply handling
+    keys.rs            per-node keys from the master secret, frame tags
+    sha256.rs          SHA-256 and HMAC, dependency-free
+    image.rs           app image parsing and checks, for OTA
+    otadata.rs         which app slot the bootloader boots
+    web.rs             the gateway's web page and stored settings
+    flash.rs           flash helpers both binaries include
     bin/node.rs        one wake: read, send over ESP-NOW, deep sleep
     bin/gateway.rs     WiFi station + ESP-NOW listener, SNTP, QWP sender
 ```
@@ -357,7 +365,7 @@ CREATE TABLE IF NOT EXISTS gateway_status (
 ) TIMESTAMP(ts) PARTITION BY DAY WAL
 DEDUP UPSERT KEYS(ts);
 
--- Written by hand whenever a node moves
+-- The gateway writes a row on every rename
 CREATE TABLE IF NOT EXISTS device_locations (
   ts TIMESTAMP, device SYMBOL, room SYMBOL, nickname SYMBOL
 ) TIMESTAMP(ts) PARTITION BY YEAR WAL;
@@ -397,7 +405,7 @@ LATEST ON ts PARTITION BY device;
 
 ## Milestones, testing and open questions
 
-Milestones are in the [v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md#milestones).
+Milestones are in the [v2 design](docs/v2-design.md#milestones).
 
 Tests:
 
@@ -407,7 +415,8 @@ Tests:
 - [ ] Move the gateway's AP to another channel: nodes find it again
 - [x] Measure average current over a few wakes with a USB power meter or the battery monitor's
   charge rate (2026-11-16, from the gauge: see the README)
-- [ ] Self-heating check: compare a node awake for 10 minutes with a sleeping one side by side
+- [ ] Self-heating check: compare a node in its enclosure with a bare one side by side, asleep
+  and after 10 minutes awake
 - [ ] Watch `rtc_drift_ppm` over a day with temperature swings
 - [ ] Run a node down to the critical threshold: no radio, red blink, normal operation
   after charging
@@ -430,3 +439,5 @@ Open questions:
 - **Reference node:** one of the three Feathers beside the Nest, or the ESPHome kit (which would
   need its own QWP path)?
 - Spill the buffer to flash during long outages, given the flash wear trade-off?
+- **Enclosure:** does the battery stay put under the shell's ribs, and how much warmer does a
+  node read inside it than bare?
