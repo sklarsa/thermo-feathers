@@ -710,7 +710,7 @@ async fn report(stack: Stack<'static>, ring: Shared) {
             uptime_s: Instant::now().as_secs() as u32,
             channel: WIFI_CHANNEL.load(Relaxed) as u8,
             ring_len: len as u32,
-            ring_dropped: dropped as u32,
+            ring_dropped: dropped,
             qwp_acks: QWP_STATS.acks.load(Relaxed),
             qwp_reconnects: QWP_STATS.reconnects.load(Relaxed),
             qwp_rejected: QWP_STATS.rejected.load(Relaxed),
