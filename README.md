@@ -42,7 +42,10 @@ The enclosure is in [enclosure/](enclosure/README.md). Pins and power rules are 
 
 ## Build and flash
 
-Same toolchain as s3-sensors: `espup install --targets esp32s3`, then source `~/export-esp.sh`.
+Same toolchain as s3-sensors: `espup install --targets esp32s3`. Jobs are in the
+[justfile](justfile) (`just` lists them); its firmware recipes source `~/export-esp.sh` and load
+secrets through [scripts/env.sh](scripts/env.sh): export them, or set `THERMO_SECRETS` to a sops
+file holding `wifi_ssid`, `wifi_password` and `thermo_master`.
 
 `THERMO_MASTER` is a secret of 64 hex digits (`openssl rand -hex 32`, once), shared by every node
 build and the gateway. Each node gets its own key from it and its MAC. Every ESP-NOW frame is
@@ -53,7 +56,7 @@ to the frame they answer, so a recorded one can't be replayed.
 ### A new node
 
 ```sh
-THERMO_MASTER=... scripts/flash-node.sh   # Linux: builds, then flashes the next board on USB
+just flash-node   # Linux: builds, then flashes the next board on USB (scripts/flash-node.sh)
 ```
 
 The script writes the node's key into its `creds` partition and flashes `bootloader/bootloader.bin`,
@@ -72,7 +75,7 @@ updates over the air.
 ### Updating nodes
 
 ```sh
-scripts/ota.sh <gateway address> [all | id,id]   # builds, then hands the image to the gateway
+just ota [all | id,id]   # builds, then hands the image to the gateway at $THERMO_GATEWAY
 ```
 
 Or upload the `.bin` from `espflash save-image` on the gateway's Settings page.
@@ -92,17 +95,16 @@ Any ESP32-S3 Feather with PSRAM, on a USB wall supply, with nothing attached. It
 on WiFi, so it's the only build that needs credentials:
 
 ```sh
-WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 THERMO_MASTER=... \
-    cargo run --release --bin gateway
+QUESTDB_ADDR=192.168.1.10:9000 just gateway   # cargo run --release --bin gateway
 ```
 
 `cargo run` flashes the rollback bootloader too. The gateway logs its IP address and WiFi channel
 over USB serial once connected; reserve that address in your router.
 
-After the first USB flash it updates over the network, with the same variables set:
+After the first USB flash it updates over the network:
 
 ```sh
-scripts/ota.sh <gateway address> gateway
+just ota gateway
 ```
 
 - It writes the image to its other slot, waits until QuestDB has everything it holds, notes the
@@ -132,14 +134,16 @@ page:
 
 The settings live in the gateway's flash.
 
-## Host tests
+## Host tests and CI
 
-The logic in `src/lib.rs` and its modules runs on the host against a checkout of qwp-embedded next to this repo:
+`just test` runs the logic in `src/lib.rs` and its modules on the host, against a checkout of
+qwp-embedded next to this repo (or `QWP_EMBEDDED`). `just check` runs what CI does: those tests,
+fmt, and clippy with dummy secrets.
 
-```sh
-rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib
-rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp_embedded.rlib -o /tmp/thermo-tests && /tmp/thermo-tests
-```
+## Enclosure
+
+`just stl` rebuilds every STL in `enclosure/stl`; `just core <id>` makes a new node's core. See
+[enclosure/](enclosure/README.md).
 
 ## License
 

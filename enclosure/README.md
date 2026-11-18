@@ -55,7 +55,7 @@ Give each core its node's device ID (on the gateway's page, or in device_status)
 back so a node can be told apart after moving rooms:
 
 ```sh
-openscad -D 'part="core"' -D 'id="610338"' -o enclosure/stl/core_610338.stl enclosure/main.scad
+just core 610338
 ```
 
 `stl/` has them built: a core for each node so far, and `core.stl` without an ID.
