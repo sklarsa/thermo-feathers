@@ -6,7 +6,8 @@
 // around 55 °C: keep nodes out of sunny windows.
 //
 // Print the test_* parts (main.scad) before a whole core: each is cut from the same geometry.
-// The snap has no test part: it clicked on the first print. Strain ~0.6 %, 0.5 mm catch, 0.3 mm play.
+// The snap has no test part. A 0.5 mm catch clicked but shook off: the 0.3 mm play and the core's
+// first-layer back edge ate most of it.
 
 // ---- Fits ----
 tol = 0.3;          // gap around a board or the battery, from light-show
@@ -39,7 +40,7 @@ sht_side = 0.15;    // each side, between it and the rails' inside faces
 sht_lip = 0.8;      // how far the lips reach over its back corners
 
 // ---- Shell snap interface: tabs in the sleeve's side walls click over the core's back edge ----
-snap_lip = 0.5;     // how far a tab's lip reaches over the core's back edge
+snap_lip = 1.0;     // how far a tab's lip reaches over the core's back edge; 0.5 shook off
 snap_arm = 14;      // free length of each tab, back edge to root. Strain ~ 1.5·t·lip / arm²
 snap_tab_w = 10;    // width of each tab
 slit = 0.8;         // the slits that free a tab, as light-show's LED clips
