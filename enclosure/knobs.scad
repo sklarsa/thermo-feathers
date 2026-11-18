@@ -20,6 +20,7 @@ root_flare = 3;     // extra diameter at a post's root, tapering to nothing 3 mm
 pin_post_d = 3.2;   // under the pins: clear of the ESP32-S3 module beside them
 m25_pilot = 2.2;    // M2.5 self-tapping pilot; 2.0 if the screw spins, 2.4 if it won't go in
 pin_d = 1.9;        // locating pins in its 2.2 mm holes
+btn_d = 3.2;        // RESET and BOOT holes: a toothpick or a SIM tool
 jst_room = 10;      // above the board, for the battery plug and the bend in its wires
 
 // ---- Wall hanging: a keyhole for a pan-head screw ----

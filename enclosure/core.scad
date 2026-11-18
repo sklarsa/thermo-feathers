@@ -96,10 +96,17 @@ module usb_cut(shell = false) {
   if (shell) translate([-60, -5, usb_c.z - usb_open[1] / 2]) cube([60 + usb_face_x, usb_y1 + 5, usb_open[1]]);
 }
 
-// Paperclip holes in the back, straight onto RESET and BOOT. BOOT is held while tapping RESET to
-// flash a board over USB; both are needed only for that and for a node that won't wake.
-module button_holes() for (b = [f_reset, f_boot]) let(p = fpos(b))
-  translate([p.x, -1, p.z]) rotate([-90, 0, 0]) cylinder(d = 1.8, h = wall + 2, $fn = 16);
+// Holes in the back, straight onto RESET and BOOT, for a toothpick or a SIM tool. BOOT is held while
+// tapping RESET to flash a board over USB; both are needed only for that and for a node that won't
+// wake. Each is funnelled on the outside, and a tube runs it to just short of the button, so the
+// STEMMA QT cable can't lie across it.
+btn_top = qt_gap - 1.9;       // the KMR2 stands 1.9 off the board
+module button_holes() for (b = [f_reset, f_boot]) let(p = fpos(b)) translate([p.x, -1, p.z]) rotate([-90, 0, 0]) {
+  cylinder(d = btn_d, h = wall + btn_top + 2, $fn = 24);
+  translate([0, 0, 1 - 0.01]) cylinder(d1 = btn_d + 3, d2 = btn_d, h = 1.5, $fn = 24);
+}
+module button_tubes() for (b = [f_reset, f_boot]) let(p = fpos(b))
+  translate([p.x, wall - 0.5, p.z]) rotate([-90, 0, 0]) cylinder(d = btn_d + 2, h = btn_top, $fn = 24);   // ends 0.5 off it
 
 // To hang it on a wall: a keyhole for a pan-head screw, its head into the space behind the battery,
 // between the fins and clear of the cable's run.
@@ -174,10 +181,12 @@ module core() {
         id_label();
       }
       feather_mounts();
+      button_tubes();
       battery_fins();
       sht_holder();
     }
     usb_cut();
+    button_holes();
   }
 }
 

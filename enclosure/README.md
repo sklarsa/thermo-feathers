@@ -40,8 +40,9 @@ on a screw.
   plate keeps them there.
 - **Prints without supports.** The core prints back down, so every wall, fin and post rises
   straight off the bed. Shells print front down, as the shell.scad notes say.
-- **Paperclip holes** in the back reach RESET and BOOT: hold BOOT, tap RESET, to flash a
-  factory-fresh or wedged board over USB. The CHG LED is next to the USB socket and shows through
+- **Button holes** in the back reach RESET and BOOT with a toothpick or a SIM tool: hold BOOT,
+  tap RESET, to flash a factory-fresh or wedged board over USB. A tube runs each hole to its
+  button, so the STEMMA QT cable can't cover it. The CHG LED is next to the USB socket and shows through
   its opening.
 
 ## Print
@@ -65,7 +66,7 @@ geometry:
 
 | Part | Checks | Knobs (`knobs.scad`) |
 |---|---|---|
-| `test_feather` | Feather on its standoffs and pins, screws biting, USB plug in, buttons by paperclip | `m25_pilot`, `pin_d`, `qt_gap` |
+| `test_feather` | Feather on its standoffs and pins, screws biting, USB plug in, buttons by toothpick | `m25_pilot`, `pin_d`, `qt_gap` |
 | `test_sensor` | SHT41 slides in under its lips and sits still | `sht_play`, `sht_lip` |
 
 `part="check_core"` and `part="check"` intersect the boards with the core or the shell: both
@@ -101,6 +102,7 @@ is the only one so far. Its holes must open over the sensor pocket.
 
 - First core, shell and test pieces printed 2026-11-17. Fixed since, not yet printed: flared post
   roots (one broke off mid-print), a snugger SHT41, a cable slot the battery fin no longer
-  blocks, the shell's battery ribs and the BATTERY label.
+  blocks, the shell's battery ribs and the BATTERY label,
+  a 1.0 mm snap catch (0.5 shook off), and 3.2 mm button holes with tubes (the cable covered them).
 - Other numbers are still from Adafruit's board files, not calipers.
 - More shells.
