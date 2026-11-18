@@ -141,20 +141,6 @@ rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-
 rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp_embedded.rlib -o /tmp/thermo-tests && /tmp/thermo-tests
 ```
 
-## Departures from the spec
-
-- QWP comes from the qwp-embedded crate instead of a copy of `s3-sensors/src/qwp.rs`. The crate
-  already encodes SYMBOL columns and the delta symbol dictionary (`Encoder::with_symbols`), so
-  the spec's SYMBOL work is done.
-
-## Open questions
-
-Beyond the ones in [SPEC.md](SPEC.md#open-questions):
-
-- Enclosure ([enclosure/](enclosure/README.md)): a first core and shell printed (2026-11-17);
-  the fixes from them (post roots, sensor fit, cable slot, battery ribs) aren't printed yet.
-  Self-heating inside it is the side-by-side check's main error. Only the plain shell exists.
-
 ## License
 
 MIT

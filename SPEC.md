@@ -216,7 +216,8 @@ first four count since the gateway booted.
 Sending, on the gateway:
 
 - QWP over WebSocket with [qwp-embedded](https://github.com/sklarsa/qwp-embedded), one persistent
-  connection. Device IDs and firmware versions are SYMBOLs in its symbol table.
+  connection. Device IDs and firmware versions are SYMBOLs, sent with its delta symbol dictionary
+  (`Encoder::with_symbols`).
 - Rows queue in a 1 MB PSRAM ring and leave it only on QuestDB's ack. The status row is skipped
   until the node has time.
 
@@ -439,5 +440,7 @@ Open questions:
 - **Reference node:** one of the three Feathers beside the Nest, or the ESPHome kit (which would
   need its own QWP path)?
 - Spill the buffer to flash during long outages, given the flash wear trade-off?
-- **Enclosure:** does the battery stay put under the shell's ribs, and how much warmer does a
-  node read inside it than bare?
+- **Enclosure** ([enclosure/](enclosure/README.md)): a first core and shell printed 2026-11-17;
+  the fixes from them (post roots, sensor fit, cable slot, battery ribs) aren't printed yet. Does
+  the battery stay put under the ribs, and how much warmer does a node read inside it than bare?
+  That self-heating is the side-by-side check's main error. Only the plain shell exists.
