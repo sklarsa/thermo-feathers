@@ -9,13 +9,16 @@ same image.
 
 [SPEC.md](SPEC.md) is the spec; the
 [v2 design](docs/superpowers/specs/2026-11-10-espnow-gateway-design.md) explains the move to ESP-NOW.
-**Status:** v2 milestones 1–5 done on one node. Milestone 1: 841 deep-sleep wakes in a row
-(2026-11-10). Milestone 2: node to gateway to QuestDB over ESP-NOW (2026-11-11). Milestone 3:
-gateway off for 60 min, then QuestDB off for 30 min (2026-11-11), with every reading stored
-once and none duplicated. Milestone 4: the gateway's web page (2026-11-12). Milestone 5: nodes
-update over ESP-NOW and roll back an image that fails (2026-11-12). Since then: per-node keys and
-encrypted links (2026-11-13), gateway updates kept only once the nodes report (2026-11-13), and a
-second node (2026-11-16).
+
+**Status:** three nodes running. Done:
+
+- 841 deep-sleep wakes in a row (2026-11-10)
+- node → gateway → QuestDB over ESP-NOW (2026-11-11)
+- no reading lost or duplicated through a 60 min gateway outage and a 30 min QuestDB outage (2026-11-11)
+- the gateway's web page (2026-11-12)
+- updates over ESP-NOW, with rollback of a failed image (2026-11-12)
+- per-node keys, encrypted links, gateway updates kept only once nodes report (2026-11-13)
+- ESP-NOW link counters in device_status and gateway_status (2026-11-17)
 
 Battery, measured on one node's 1200 mAh LiPo: a 60 s wake uses about 0.07 % an hour (about two
 months a charge), 5 s about 1 % an hour (four days). Nearly all of it is wakes, so the time
