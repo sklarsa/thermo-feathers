@@ -117,6 +117,16 @@ module keyhole() translate([key_c.x, -1, key_c.y]) rotate([-90, 0, 0]) linear_ex
   translate([0, -6]) circle(d = key_shank, $fn = 24);
 }
 
+// The shell's screw: in the sensor pocket's +x end, clear of the SHT41's rails and of the cable
+// (-x). The back wall is thickened round it so the head sits flush and 4 mm of a 6 mm screw bites.
+screw_c = [in_x1 - 6, (feet + floor_t + pocket_top) / 2];
+boss_t = 2;
+module screw_boss() translate([screw_c.x, wall - 0.5, screw_c.y]) rotate([-90, 0, 0]) cylinder(d = 7.5, h = boss_t + 0.5, $fn = 32);
+module screw_hole() translate([screw_c.x, -1, screw_c.y]) rotate([-90, 0, 0]) {
+  cylinder(d = screw_clear, h = wall + boss_t + 2, $fn = 24);
+  cylinder(d = screw_head[0], h = 1 + screw_head[1], $fn = 32);
+}
+
 // The device ID, cut into the back: it prints on the bed, so it comes out crisp. Reads from behind,
 // below the keyhole.
 module id_label() if (id != "") translate([0, -0.01, bay_z + 2.5]) rotate([90, 0, 0]) mirror([0, 0, 1])
@@ -182,11 +192,13 @@ module core() {
       }
       feather_mounts();
       button_tubes();
+      screw_boss();
       battery_fins();
       sht_holder();
     }
     usb_cut();
     button_holes();
+    screw_hole();
   }
 }
 

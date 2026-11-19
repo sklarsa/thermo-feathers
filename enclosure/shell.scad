@@ -70,7 +70,12 @@ module shell_body(rim) {
   }
   tab_lips();
   batt_ribs();
+  screw_post();
 }
+
+// The post the screw through the core's back bites into; the tabs only line the shell up.
+module screw_post() let(y0 = wall + boss_t + 0.2) translate([screw_c.x, y0, screw_c.y]) rotate([-90, 0, 0])
+  difference() { cylinder(d = 6, h = shell_front_y - y0 + 0.01, $fn = 32); translate([0, 0, -1]) cylinder(d = m25_pilot, h = 8, $fn = 24); }
 
 // Ribs on the front plate's inside, over the battery's fins: they press it batt_press onto them.
 module batt_ribs() for (x = [batt_x + 10, batt_x + batt[1] - 6])

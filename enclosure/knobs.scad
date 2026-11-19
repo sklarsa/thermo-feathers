@@ -6,8 +6,8 @@
 // around 55 °C: keep nodes out of sunny windows.
 //
 // Print the test_* parts (main.scad) before a whole core: each is cut from the same geometry.
-// The snap has no test part. A 0.5 mm catch clicked but shook off: the 0.3 mm play and the core's
-// first-layer back edge ate most of it.
+// The snap only lines the shell up; a screw holds it. 0.5 and 1.0 mm catches both shook off: the
+// catch faces are the core's first layer and an overhang on the shell, and print rounded.
 
 // ---- Fits ----
 tol = 0.3;          // gap around a board or the battery, from light-show
@@ -39,6 +39,10 @@ sht_back = 0.5;     // air between its back edge and the back wall
 sht_play = 0.1;     // between it and its lips; 0.3 rattled. More if it won't slide in
 sht_side = 0.15;    // each side, between it and the rails' inside faces
 sht_lip = 0.8;      // how far the lips reach over its back corners
+
+// ---- Shell screw: one M2.5 x 6 from the back, through the core into a post on the shell ----
+screw_clear = 2.9;  // through the core
+screw_head = [5.5, 2.0]; // counterbore for the pan head, so the back stays flat on a wall
 
 // ---- Shell snap interface: tabs in the sleeve's side walls click over the core's back edge ----
 snap_lip = 1.0;     // how far a tab's lip reaches over the core's back edge; 0.5 shook off

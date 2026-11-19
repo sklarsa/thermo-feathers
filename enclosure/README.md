@@ -36,8 +36,9 @@ on a screw.
   screws through the Feather's plated holes into printed standoffs, pins in its smaller unplated
   holes at the antenna end. The standoffs leave 7 mm under the board for the JST-PH socket and the
   STEMMA QT plug's turn.
-- **No tools for the rest.** The battery and the SHT41 slide in from the front; the shell's front
-  plate keeps them there.
+- **The shell is screwed on**, by one M2.5 screw from the back into a post on the shell, flush in
+  a counterbore. Snap tabs alone shook off; they now only line it up. The battery and the SHT41
+  slide in from the front, and the shell's front plate keeps them there.
 - **Prints without supports.** The core prints back down, so every wall, fin and post rises
   straight off the bed. Shells print front down, as the shell.scad notes say.
 - **Button holes** in the back reach RESET and BOOT with a toothpick or a SIM tool: hold BOOT,
@@ -76,7 +77,8 @@ and an ImageMagick with PNG support.
 
 ## Parts
 
-- 2 × M2.5 × 6 mm pan-head self-tapping screws (the Feather); the pins at the antenna end only locate it
+- 3 × M2.5 × 6 mm pan-head self-tapping screws: two for the Feather (the pins at the antenna end
+  only locate it), one for the shell
 - a STEMMA QT cable of 100 mm (Adafruit 4210); the run is about 85 mm, and a longer one coils
   behind the battery
 - to hang it: a pan-head screw with a head under 7.5 mm and a shank under 3.8 mm
@@ -90,7 +92,8 @@ and an ImageMagick with PNG support.
 2. Plug the cable into the SHT41's nearer socket, then slide the SHT41 in from the front on its
    rails, sensor up, until it stops at the back wall under its lips.
 3. Stand the battery on the floor where it says BATTERY, in front of the board's USB half, wires at the top. Ribs inside the shell press it onto its fins.
-4. Push the shell on from the front until both tabs click.
+4. Push the shell on from the front until both tabs click, then drive the third screw into
+   the counterbored hole low on the back (on the right, seen from behind).
 
 ## Shells
 
@@ -103,6 +106,7 @@ is the only one so far. Its holes must open over the sensor pocket.
 - First core, shell and test pieces printed 2026-11-17. Fixed since, not yet printed: flared post
   roots (one broke off mid-print), a snugger SHT41, a cable slot the battery fin no longer
   blocks, the shell's battery ribs and the BATTERY label,
-  a 1.0 mm snap catch (0.5 shook off), and 3.2 mm button holes with tubes (the cable covered them).
+  a 1.0 mm snap catch (0.5 shook off), 3.2 mm button holes with tubes (the cable covered them), and the
+  shell screw (the snap still shook off).
 - Other numbers are still from Adafruit's board files, not calipers.
 - More shells.
