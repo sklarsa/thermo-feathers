@@ -63,7 +63,7 @@ just core 610338
 `stl/` has them built: a core for each node so far, and `core.stl` without an ID.
 
 After changing a fit, print its test piece rather than a whole core. Each is cut from the same
-geometry:
+geometry; build one with `openscad -D 'part="test_feather"' -o test_feather.stl main.scad`:
 
 | Part | Checks | Knobs (`knobs.scad`) |
 |---|---|---|

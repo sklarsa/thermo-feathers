@@ -20,7 +20,6 @@ OUT = os.path.join(HERE, "renders")
 TMP = os.path.join(OUT, "tmp")
 STL = os.path.join(HERE, "stl")
 CORE_COLOR = "#3a3d45"
-TESTS = ["test_feather", "test_sensor"]
 
 # Views are rendered turned 180 degrees about z (turn=true), so the node's front faces OpenSCAD's
 # front (-y). Cameras are gimbal (translate, rotate, distance): with eye/centre cameras OpenSCAD
@@ -160,7 +159,6 @@ def main():
         with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
             jobs = [ex.submit(stl, os.path.join(STL, "core.stl"), "core"),
                     ex.submit(stl, os.path.join(TMP, "core_view.stl"), "core_view_only"),
-                    *[ex.submit(stl, os.path.join(STL, f"{t}.stl"), t) for t in TESTS],
                     ex.submit(stl, os.path.join(TMP, "hardware.stl"), "hardware")]
             for s in names:
                 for c in range(1, NCOL[s] + 1):
