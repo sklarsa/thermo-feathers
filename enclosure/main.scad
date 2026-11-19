@@ -51,10 +51,10 @@ if (part == "test_feather") core_print() cut([-core_W, -1, board_z - 1.5], [boar
 if (part == "test_sensor") core_print() cut([-core_W, -1, -1], [core_W, core_D + 1, bay_z + 0.01]) core();
 if (part == "palette") for (s = shells) echo(str("SHELL|", s[0], "|", s[1], "|", s[2][0], "|", s[2][1], "|", s[2][2], "|", s[2][3]));
 
-// Section through the snap tabs, seen from above. OpenCSG paints every cut face one colour, so
+// Section through the shell screw, seen from above. OpenCSG paints every cut face one colour, so
 // render.py exports each cut part with CGAL (sec_*) and draws them together.
-module sec() translate([0, 0, 10]) rotate([90, 0, 0]) translate([0, 0, -tab_z]) shown()
-  difference() { children(); translate([-150, -150, tab_z]) cube(300); }
+module sec() translate([0, 0, 10]) rotate([90, 0, 0]) translate([0, 0, -screw_c.y]) shown()
+  difference() { children(); translate([-150, -150, screw_c.y]) cube(300); }
 if (part == "sec_core") sec() core();
 if (part == "sec_hw") sec() hardware();
 if (part == "sec_shell") sec() the_shell(c = 1);

@@ -1,5 +1,5 @@
 // What every shell (cover) shares: a sleeve that hugs the core on the top, sides and front,
-// with the standard snap tabs, USB opening and side vents. A design supplies only flat 2D artwork:
+// with the standard screw post, USB opening and side vents. A design supplies only flat 2D artwork:
 //
 //   shell_build(part, palette) {
 //     silhouette;        // front outline; the sleeve is added to it, so it can't be too small
@@ -22,24 +22,9 @@ include <core.scad>
 
 shell_front_y = core_D + shell_clear;              // inside face of the front plate
 shell_D = shell_front_y + front_t;                 // the outside face, which prints on the bed
-lip_back = 1.4;                                    // how far the sleeve runs behind the core's back face
 
 module core_clear() xz(-10, shell_front_y + 10) offset(delta = shell_clear) core_outline();
 module sleeve_outline() offset(delta = shell_clear + shell_t) core_outline();
-
-// Snap tabs: in each side wall, two slits free a strip from the back edge forward to its root; a
-// lip at its free end clicks over the core's back edge. Strain ~ 1.5·t·lip / arm².
-tab_z = (bay_z + usb_c.z - usb_open[1] / 2) / 2;   // between the thermal break and the USB opening
-module tab_band(s, extra = 0) translate([s > 0 ? 0 : -80, -lip_back - 1, tab_z - snap_tab_w / 2 - extra]) cube([80, snap_arm + lip_back + 1, snap_tab_w + 2 * extra]);
-module tab_cuts() for (s = [-1, 1]) {
-  for (dz = [-snap_tab_w / 2 - slit, snap_tab_w / 2]) translate([s > 0 ? 0 : -80, -lip_back - 1, tab_z + dz]) cube([80, snap_arm + lip_back + 1, slit]);
-  difference() { tab_band(s, slit); xz(-lip_back - 2, snap_arm + lip_back + 4) sleeve_outline(); }   // strip is only shell_t thick
-}
-module tab_lips() for (s = [-1, 1]) for (j = [0 : 2]) intersection() {
-  // three steps make the ramp: full lip at the catch face (y = 0), thinner towards the back
-  xz(-(j + 1) * lip_back / 3, lip_back / 3) difference() { offset(delta = shell_clear + 0.1) core_outline(); offset(delta = -snap_lip * (3 - j) / 3) core_outline(); }
-  tab_band(s);
-}
 
 // Side vents over the sensor pocket and the thermal break, matching the core's.
 module side_vents() for (s = [-1, 1]) {
@@ -55,11 +40,10 @@ module shell_body(rim) {
       xz(shell_front_y, front_t) union() { art() children(0); sleeve_outline(); }             // front plate
       // the silhouette's own edge wall, rim deep (the sleeve is full depth anyway)
       xz(shell_front_y - rim, rim) difference() { union() { art() children(0); sleeve_outline(); } offset(delta = -shell_t) union() { art() children(0); sleeve_outline(); } }
-      xz(-lip_back, shell_front_y + lip_back) sleeve_outline();                         // sleeve
+      xz(0, shell_front_y) sleeve_outline();                                           // sleeve, flush with the core's back
     }
     core_clear();
     xz(shell_front_y - 1, front_t + 2) art() children(1);                                     // holes
-    tab_cuts();
     side_vents();
     usb_cut(shell = true);
     translate([-200, -50, -50]) cube([400, 100, 50]);                                    // flat on the shelf
@@ -68,12 +52,11 @@ module shell_body(rim) {
       offset(delta = 20) art() union() { children(0); sleeve_outline(); }
       offset(delta = -(edge_ch - i * 0.2)) art() union() { children(0); sleeve_outline(); } }
   }
-  tab_lips();
   batt_ribs();
   screw_post();
 }
 
-// The post the screw through the core's back bites into; the tabs only line the shell up.
+// The post the screw through the core's back bites into: all that holds the shell on.
 module screw_post() let(y0 = wall + boss_t + 0.2) translate([screw_c.x, y0, screw_c.y]) rotate([-90, 0, 0])
   difference() { cylinder(d = 6, h = shell_front_y - y0 + 0.01, $fn = 32); translate([0, 0, -1]) cylinder(d = m25_pilot, h = 8, $fn = 24); }
 

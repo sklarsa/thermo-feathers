@@ -29,7 +29,7 @@ VIEWS = {
     "back": ("assembly", "0,0,38,66,0,204,330", True),
     "side": ("assembly", "0,0,38,80,0,90,330", True),
     "exploded": ("exploded", "0,-20,38,64,0,40,400", True),
-    "section": ("section", "0,0,0,90,0,0,150", False),  # through the snap tabs, from above
+    "section": ("section", "0,0,0,90,0,0,150", False),  # through the shell screw, from above
 }
 
 

@@ -1,4 +1,4 @@
-// The common core: holds the Feather, the battery and the SHT41, and carries the standard snap
+// The common core: holds the Feather, the battery and the SHT41, and carries the standard screw
 // interface every shell clicks onto. Open at the front: everything goes in from there, and the
 // shell's front plate closes it.
 //

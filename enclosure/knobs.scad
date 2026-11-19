@@ -1,13 +1,12 @@
 // Shared knobs for the core and every shell. Hardware never matches the datasheet: change a knob,
 // reprint the matching test_* part, repeat.
 //
-// Material is PLA, not PETG as in esp-light-show. PLA is stiffer and more brittle and creeps less,
-// so snap arms are longer and lips smaller, keeping bending strain under about 2 %. PLA softens
+// Material is PLA, not PETG as in esp-light-show: stiffer, more brittle, creeps less. It softens
 // around 55 °C: keep nodes out of sunny windows.
 //
 // Print the test_* parts (main.scad) before a whole core: each is cut from the same geometry.
-// The snap only lines the shell up; a screw holds it. 0.5 and 1.0 mm catches both shook off: the
-// catch faces are the core's first layer and an overhang on the shell, and print rounded.
+// A screw holds the shell on. Snap tabs were tried and shook off: their catch faces were the core's
+// first layer and an overhang on the shell, and both printed rounded.
 
 // ---- Fits ----
 tol = 0.3;          // gap around a board or the battery, from light-show
@@ -44,12 +43,6 @@ sht_lip = 0.8;      // how far the lips reach over its back corners
 screw_clear = 2.9;  // through the core
 screw_head = [5.5, 2.0]; // counterbore for the pan head, so the back stays flat on a wall
 
-// ---- Shell snap interface: tabs in the sleeve's side walls click over the core's back edge ----
-snap_lip = 1.0;     // how far a tab's lip reaches over the core's back edge; 0.5 shook off
-snap_arm = 14;      // free length of each tab, back edge to root. Strain ~ 1.5·t·lip / arm²
-snap_tab_w = 10;    // width of each tab
-slit = 0.8;         // the slits that free a tab, as light-show's LED clips
-
 // ---- Colour (AMS): shells print face down, so face artwork is inlaid in the first layers ----
 inlay_t = 0.6;      // inlay depth: 3 layers at 0.2 mm, each colour swap happens only there
 
@@ -59,5 +52,3 @@ shell_t = 1.6;      // shell sleeve and rim walls
 front_t = 1.8;      // shell front plate; it prints on the bed
 edge_ch = 0.8;      // chamfer round the cover's front edge
 
-function strain(t, lip, arm) = 1.5 * t * lip / (arm * arm);
-echo(str("shell tab strain ", round(strain(shell_t, snap_lip, snap_arm) * 1000) / 10, " %"));
