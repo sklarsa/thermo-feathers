@@ -36,7 +36,7 @@ the battery connector.
 | STEMMA QT cable 100 mm | 4210 | Runs down to the sensor, below the board in the enclosure | n/a |
 
 The enclosure ([enclosure/](enclosure/README.md)) puts the SHT41 below everything that makes heat,
-with a vented gap between them; two M2.5 screws hold the Feather.
+with a vented gap between them; two M2.5 screws hold the Feather and a third the shell.
 
 Pin and power rules:
 

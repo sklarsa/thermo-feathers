@@ -33,7 +33,7 @@ Per node. Everything is from Adafruit and plugs together, no soldering.
 | 1 | [ESP32-S3 Feather, 4 MB flash / 2 MB PSRAM](https://www.adafruit.com/product/5477) | 5477 | Has the MAX17048 battery gauge on board |
 | 1 | [SHT41 temperature and humidity sensor, STEMMA QT](https://www.adafruit.com/product/5776) | 5776 | |
 | 1 | STEMMA QT cable, 100 mm ([4210](https://www.adafruit.com/product/4210)) | | The enclosure's run is about 85 mm; longer coils behind the battery |
-| 2 | M2.5 × 6 mm pan-head self-tapping screws | | Hold the Feather in the enclosure |
+| 3 | M2.5 × 6 mm pan-head self-tapping screws | | Two hold the Feather, one the shell |
 | 1 | [LiPo 3.7 V 1200 mAh](https://www.adafruit.com/product/258) | 258 | |
 | 1 | USB-C cable and 5 V USB power supply | | Flashing, charging, and plugged-in running |
 
