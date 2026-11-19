@@ -117,9 +117,10 @@ module keyhole() translate([key_c.x, -1, key_c.y]) rotate([-90, 0, 0]) linear_ex
   translate([0, -6]) circle(d = key_shank, $fn = 24);
 }
 
-// The shell's screw: in the sensor pocket's +x end, clear of the SHT41's rails and of the cable
-// (-x). The back wall is thickened round it so the head sits flush and 4 mm of a 6 mm screw bites.
-screw_c = [in_x1 - 6, (feet + floor_t + pocket_top) / 2];
+// The shell's screw: in the bay's dead space between the battery's stop fin and the +x wall, under
+// the board and well below its antenna. The back wall is thickened round it so the head sits flush
+// and 4 mm of a 6 mm screw bites.
+screw_c = [(batt_x + batt[1] + 2 * tol + 1.6 + in_x1) / 2, bay_z + 8];
 boss_t = 2;
 module screw_boss() translate([screw_c.x, wall - 0.5, screw_c.y]) rotate([-90, 0, 0]) cylinder(d = 7.5, h = boss_t + 0.5, $fn = 32);
 module screw_hole() translate([screw_c.x, -1, screw_c.y]) rotate([-90, 0, 0]) {

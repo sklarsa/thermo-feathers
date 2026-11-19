@@ -93,7 +93,7 @@ and an ImageMagick with PNG support.
    rails, sensor up, until it stops at the back wall under its lips.
 3. Stand the battery on the floor where it says BATTERY, in front of the board's USB half, wires at the top. Ribs inside the shell press it onto its fins.
 4. Push the shell on from the front until both tabs click, then drive the third screw into
-   the counterbored hole low on the back (on the right, seen from behind).
+   the counterbored hole on the back, beside the device ID.
 
 ## Shells
 
