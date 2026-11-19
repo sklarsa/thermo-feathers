@@ -293,7 +293,7 @@ status row.
 | Situation | Behaviour |
 |---|---|
 | Wake runs too long | Radio part capped at 2 s; force sleep |
-| Sensor missing or failing | Store the sample with SENSOR_FAIL; keep sending status |
+| Sensor missing or failing | Store the sample with SENSOR_FAIL; keep sending status. The gateway's page shows "sensor not answering" until a good reading |
 | Gateway unreachable | Keep buffering; sweep with backoff as in [Radio](#radio) |
 | QuestDB unreachable | The gateway buffers in PSRAM and keeps acking nodes (not on an update's trial: see [Buffering](#buffering-and-batching)) |
 | Buffer full | Drop oldest, count in `dropped_samples` |

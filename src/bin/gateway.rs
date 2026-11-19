@@ -448,6 +448,7 @@ async fn espnow(mut esp: EspNow, ring: Shared) -> ! {
                     temp_c: f32::NAN,
                     rh_pct: f32::NAN,
                     charging: false,
+                    sensor_fail: false,
                     battery_pct,
                     rssi,
                 };

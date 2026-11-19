@@ -4,7 +4,7 @@
 use core::fmt::{self, Write};
 
 use crate::proto::CHUNK;
-use crate::{CHARGING, Sample, WAKE_MAX_S, WAKE_MIN_S, crc8};
+use crate::{CHARGING, SENSOR_FAIL, Sample, WAKE_MAX_S, WAKE_MIN_S, crc8};
 
 /// Nodes the page tracks and names it keeps. The design has room for 4.
 pub const MAX_NODES: usize = 8;
@@ -226,6 +226,8 @@ pub struct Seen {
     pub temp_c: f32,
     pub rh_pct: f32,
     pub charging: bool,
+    /// The newest sample says the SHT41 didn't answer (unplugged, or dead).
+    pub sensor_fail: bool,
     /// NaN without a battery gauge.
     pub battery_pct: f32,
     pub fw: [u8; 12],
@@ -248,6 +250,10 @@ impl Nodes {
         } else if let Some(o) = old.and_then(|i| self.0[i]) {
             (s.temp_c, s.rh_pct, s.charging) = (o.temp_c, o.rh_pct, o.charging);
         }
+        s.sensor_fail = match samples.last() {
+            Some(x) => x.flags & SENSOR_FAIL != 0,
+            None => old.and_then(|i| self.0[i]).is_some_and(|o| o.sensor_fail),
+        };
         let i = old
             .or_else(|| self.0.iter().position(Option::is_none))
             .unwrap_or_else(|| {
@@ -681,7 +687,9 @@ pub fn render_home(
             write!(w, "{t:.1}{unit}")?;
         }
         w.write_str("</div><div class=sub>")?;
-        if !x.rh_pct.is_nan() {
+        if x.sensor_fail {
+            w.write_str("<span class=bad>sensor not answering</span> · ")?;
+        } else if !x.rh_pct.is_nan() {
             write!(w, "{:.0}% RH · ", x.rh_pct)?;
         }
         if x.charging {
@@ -976,6 +984,7 @@ mod tests {
             temp_c: f32::NAN,
             rh_pct: f32::NAN,
             charging: false,
+            sensor_fail: false,
             battery_pct: 50.0,
             fw: *b"0.3.0\0\0\0\0\0\0\0",
             rssi: -45,
@@ -988,7 +997,11 @@ mod tests {
         n.heard(seen(b"aaaaaa", 1), &[Sample::new(1, 21.5, 40.0, 0)]);
         n.heard(seen(b"aaaaaa", 2), &[Sample::new(2, f32::NAN, f32::NAN, 1)]);
         let a = n.0[0].unwrap();
-        assert_eq!((a.at_s, a.temp_c), (2, 21.5));
+        assert_eq!((a.at_s, a.temp_c, a.sensor_fail), (2, 21.5, true));
+        n.heard(seen(b"aaaaaa", 3), &[]); // a status-only frame keeps it
+        assert!(n.0[0].unwrap().sensor_fail);
+        n.heard(seen(b"aaaaaa", 4), &[Sample::new(4, 21.0, 40.0, 0)]);
+        assert!(!n.0[0].unwrap().sensor_fail);
         for i in 0..MAX_NODES as u8 {
             n.heard(
                 seen(&[b'b', b'b', b'b', b'b', b'b', b'0' + i], 10 + i as u64),
@@ -1008,6 +1021,10 @@ mod tests {
         low.battery_pct = 7.0;
         n.heard(low, &[Sample::new(1, 20.0, 41.0, 0)]);
         n.heard(seen(b"bbbbbb", 0), &[Sample::new(1, 22.0, 40.0, 0)]);
+        n.heard(
+            seen(b"bbbbbb", 0),
+            &[Sample::new(2, f32::NAN, f32::NAN, SENSOR_FAIL)],
+        );
         let g = Gateway {
             fw: *b"0.4.0-a1b2c3",
             up_s: 300,
@@ -1028,6 +1045,7 @@ mod tests {
         assert!(h.contains("68.0°F") && h.contains("class=bad>battery 7%"));
         // bbbbbb: 300 s since heard, past 3 × 60 s
         assert!(h.contains("last seen 5m ago") && h.contains("Attic"));
+        assert!(h.contains("71.6°F") && h.contains("class=bad>sensor not answering"));
         assert!(h.contains("WiFi channel 6") && h.contains("QuestDB</a> up to date"));
         assert!(h.contains("href=\"http://10.0.0.2:9000/\""));
         assert!(h.contains("value=bbbbbb") && h.contains("value=\"Attic\""));

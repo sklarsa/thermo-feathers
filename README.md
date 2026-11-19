@@ -122,8 +122,8 @@ just ota gateway
 
 ### The web page
 
-At the gateway's address: each room's latest reading, battery and last-seen time. Its Settings
-page:
+At the gateway's address: each room's latest reading, battery and last-seen time, and a warning
+when its sensor stops answering (unplugged or dead). Its Settings page:
 
 - renames nodes (each rename is also a `device_locations` row)
 - switches °F/°C
