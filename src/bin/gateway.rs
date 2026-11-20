@@ -51,9 +51,7 @@ use thermo_feathers::sha256::sha256;
 #[path = "../flash.rs"]
 mod flash;
 use thermo_feathers::proto::{self, CHUNK, FRAME_MAX, Frame, Reply, UPDATE};
-use thermo_feathers::web::{
-    self, EXPECTED_LEN, Expected, Nodes, Rollout, SETTINGS_LEN, Seen, Settings, Trial,
-};
+use thermo_feathers::web::{self, Nodes, Rollout, SETTINGS_LEN, Seen, Settings};
 use thermo_feathers::*;
 
 extern crate alloc;
@@ -87,9 +85,9 @@ const MASTER: &str = env!("THERMO_MASTER");
 const QUESTDB: &str = env!("QUESTDB_ADDR"); // ip:port of QuestDB's HTTP endpoint, e.g. 192.168.1.10:9000
 const NTP_SERVER: &str = "pool.ntp.org";
 const GATEWAY_PROJECT: &str = "thermo-gateway";
-/// A new gateway image that hasn't reached WiFi, the time server, QuestDB and the nodes heard
-/// before the update by then restarts, and the bootloader goes back to the old one. Longer if
-/// the wake interval needs it: see `trial_s`.
+/// A new gateway image that hasn't reached WiFi, the time server and QuestDB by then restarts, and
+/// the bootloader goes back to the old one. Nodes don't come into it: an image that can't hear
+/// them still takes the next upload, and dead nodes mustn't block one.
 const TRIAL_S: u64 = 600;
 /// How long a restart waits for the ring to reach QuestDB: nodes deleted what's in it.
 const DRAIN: Duration = Duration::from_secs(30);
@@ -166,35 +164,6 @@ const PANIC_MAGIC: u32 = 0x7EF0_6A7E;
 /// before it.
 const PANICS_TO_FALL_BACK: u32 = 3;
 
-/// Through an update restart: the nodes the update has to hear. Through its rollback: the ones it
-/// didn't. See `web::Expected`.
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
-static mut EXPECTED: [u8; EXPECTED_LEN] = [0; EXPECTED_LEN];
-
-fn take_expected() -> Option<(Expected, Trial)> {
-    // SAFETY: plain bytes, touched by value from the executor's tasks only: at boot, and before
-    // an update's restart or a trial's rollback (never both: there's no upload on trial).
-    let b = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(EXPECTED), [0; EXPECTED_LEN]) };
-    Expected::from_bytes(&b)
-}
-
-fn put_expected(e: &Expected, t: Trial) {
-    // SAFETY: as in `take_expected`
-    unsafe { *core::ptr::addr_of_mut!(EXPECTED) = e.to_bytes(t) };
-}
-
-/// Nodes heard in this many wake intervals count as active.
-const ACTIVE_WAKES: u64 = 3;
-
-/// How long a gateway update has to hear every node: three wakes and a minute, at least TRIAL_S.
-fn trial_s(wake_s: u16) -> u64 {
-    TRIAL_S.max(ACTIVE_WAKES * wake_s as u64 + 60)
-}
-
-/// The nodes the last gateway update went back for not hearing, for the page.
-static MISSED: BlockingMutex<CriticalSectionRawMutex, Cell<Expected>> =
-    BlockingMutex::new(Cell::new(Expected::EMPTY));
-
 fn panics() -> u32 {
     // SAFETY: two words, only touched from the boot path, custom_halt and `healthy`, one at a time
     let p = unsafe { *core::ptr::addr_of!(PANICS) };
@@ -256,14 +225,6 @@ async fn main(spawner: Spawner) -> ! {
     GW_FW.lock(|f| f.set(fw));
     let trial = flash::on_trial(&mut flash);
     TRIAL.store(trial, Relaxed);
-    let expected = match take_expected() {
-        Some((e, Trial::Hear)) if trial => e,
-        Some((e, Trial::Missed)) if !trial => {
-            MISSED.lock(|m| m.set(e));
-            Expected::EMPTY
-        }
-        _ => Expected::EMPTY,
-    };
     // A confirmed image that keeps crashing: the bootloader only rolls back unconfirmed ones.
     if !trial && panics() >= PANICS_TO_FALL_BACK {
         set_panics(0);
@@ -347,7 +308,7 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(report(stack, ring).unwrap());
     spawner.spawn(http(stack, ring).unwrap());
-    spawner.spawn(healthy(trial, expected, ring).unwrap());
+    spawner.spawn(healthy(trial, ring).unwrap());
     spawner.spawn(watchdog(mk_static!(Rtc<'static>, rtc)).unwrap());
 
     espnow(esp, ring).await
@@ -855,15 +816,6 @@ async fn http(stack: Stack<'static>, ring: Shared) {
         sock.close();
         let _ = with_timeout(Duration::from_secs(2), sock.flush()).await;
         if restart {
-            // the update has to hear from every node active now
-            let (s, nodes) = UI.lock(|u| *u.borrow());
-            let active = Expected::recent(
-                &nodes,
-                Instant::now().as_secs(),
-                ACTIVE_WAKES * s.wake_s as u64,
-            );
-            put_expected(&active, Trial::Hear);
-            info!("update has to hear from {} nodes", active.ids().len());
             restart_when_drained(ring).await;
         }
     }
@@ -886,30 +838,19 @@ async fn restart_when_drained(ring: Shared) -> ! {
     esp_hal::system::software_reset()
 }
 
-/// Waits for WiFi, the time, a QuestDB ack (or nothing to send: no node is about) and, on trial,
-/// a `Data` frame from each `expected` node. Then a new image on trial is kept. One that doesn't
-/// get there within `trial_s` restarts once what it holds has reached QuestDB, and the bootloader
-/// goes back to the old one, which shows the nodes that weren't heard. The panic count starts
+/// Waits for WiFi, the time and a QuestDB ack (or nothing to send). Then a new image on trial is
+/// kept. One that doesn't get there within TRIAL_S restarts once what it holds has reached
+/// QuestDB, and the bootloader goes back to the old one. The panic count starts
 /// over once healthy, or after TRIAL_S up: crashes days apart, in an outage, aren't a crash loop.
 #[embassy_executor::task]
-async fn healthy(trial: bool, expected: Expected, ring: Shared) {
+async fn healthy(trial: bool, ring: Shared) {
     let t0 = Instant::now();
-    let limit = trial_s(UI.lock(|u| u.borrow().0.wake_s));
     if trial {
-        info!(
-            "on trial for up to {limit} s, until {} nodes report",
-            expected.ids().len()
-        );
+        info!("on trial for up to {TRIAL_S} s");
     }
     loop {
-        let missing = expected.missing(&UI.lock(|u| u.borrow().1));
-        let questdb = QWP_STATS.acks.load(Relaxed) > 0
-            || (expected.ids().is_empty() && ring.lock(|r| r.borrow().len()) == 0);
-        if WIFI_CHANNEL.load(Relaxed) != 0
-            && SYNCED.load(Relaxed)
-            && questdb
-            && (!trial || missing.ids().is_empty())
-        {
+        let questdb = QWP_STATS.acks.load(Relaxed) > 0 || ring.lock(|r| r.borrow().len()) == 0;
+        if WIFI_CHANNEL.load(Relaxed) != 0 && SYNCED.load(Relaxed) && questdb {
             set_panics(0);
             if trial {
                 with_flash(flash::confirm);
@@ -918,16 +859,12 @@ async fn healthy(trial: bool, expected: Expected, ring: Shared) {
             }
             return;
         }
-        if !trial && t0.elapsed().as_secs() > TRIAL_S {
-            set_panics(0);
-            return;
-        }
-        if trial && t0.elapsed().as_secs() > limit {
-            error!(
-                "on trial for {limit} s without WiFi, time, QuestDB or {} of its nodes: going back",
-                missing.ids().len()
-            );
-            put_expected(&missing, Trial::Missed);
+        if t0.elapsed().as_secs() > TRIAL_S {
+            if !trial {
+                set_panics(0);
+                return;
+            }
+            error!("on trial for {TRIAL_S} s without WiFi, time or QuestDB: going back");
             restart_when_drained(ring).await;
         }
         Timer::after_secs(5).await;
@@ -959,7 +896,6 @@ fn respond(route: Route, body: &[u8], ring: Shared) -> (alloc::string::String, b
         waiting: ring.lock(|r| r.borrow().len()),
         last_error: QWP_STATS.last_error.load(Relaxed),
         unsigned: UNSIGNED.lock(|u| u.get()),
-        missed: MISSED.lock(|m| m.get()),
         questdb,
         questdb_default: QUESTDB,
         ntp_default: NTP_SERVER,

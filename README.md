@@ -107,13 +107,11 @@ After the first USB flash it updates over the network:
 just ota gateway
 ```
 
-- It writes the image to its other slot, waits until QuestDB has everything it holds, notes the
-  nodes it heard in the last 3 wake intervals, and restarts into the new image.
-- The new image is kept once it reaches WiFi, the time server and QuestDB, and has heard from each
-  of those nodes. With no node active, WiFi and the time server are enough.
-- Otherwise it restarts after 10 minutes (or 3 wake intervals and a minute, if longer) and the
-  bootloader goes back to the old image, whose page names the nodes the update didn't hear. A node
-  that's gone for good blocks updates until it's back: upload again once it reports.
+- It writes the image to its other slot, waits until QuestDB has everything it holds, and
+  restarts into the new image.
+- The new image is kept once it reaches WiFi, the time server and QuestDB (or has nothing to
+  send). Nodes don't come into it: an image that can't hear them still takes the next upload.
+- Otherwise it restarts after 10 minutes and the bootloader goes back to the old image.
 - While on trial it refuses another gateway upload, since that would overwrite the image a failed
   trial goes back to. It also doesn't tell nodes their readings are stored until QuestDB has acked
   something, so nodes keep their copies. Going back waits for QuestDB first, as a restart does.
