@@ -14,7 +14,7 @@
 // check, check_core: boards intersected with the shell or the core; empty when nothing collides.
 //
 // part: assembly | exploded | core | core_view | shell | shell_view | hardware | check | check_core
-//       | test_* | palette
+//       | test_* | palette | gw_base | gw_cover | gw_assembly | gw_check (the gateway: gateway.scad)
 part = "assembly";
 id = "";           // the node's device ID (gateway page, device_status), cut into the core's back
 shell = "plain";
@@ -24,6 +24,7 @@ turn = false;      // renders: OpenSCAD lights from -y, our front is +y
 
 include <shell.scad>
 include <shells/plain.scad>
+include <gateway.scad>
 
 // name, title, palette
 shells = [["plain", "Plain", plain_palette]];
@@ -49,6 +50,10 @@ if (part == "check_core") intersection() { core(); boards(); }
 module cut(from, to) intersection() { children(); translate(from) cube(to - from); }
 if (part == "test_feather") core_print() cut([-core_W, -1, board_z - 1.5], [board_x + fw + 2, board_y + pcb + 3, board_z + fh + 4]) core();
 if (part == "test_sensor") core_print() cut([-core_W, -1, -1], [core_W, core_D + 1, bay_z + 0.01]) core();
+if (part == "gw_base") gw_base();
+if (part == "gw_cover") gw_print_cover();
+if (part == "gw_assembly") { color(core_color) gw_base(); gw_feather(); color("#e9e6df", 0.4) gw_cover(); }
+if (part == "gw_check") intersection() { gw_feather(); union() { gw_base(); gw_cover(); } }
 if (part == "palette") for (s = shells) echo(str("SHELL|", s[0], "|", s[1], "|", s[2][0], "|", s[2][1], "|", s[2][2], "|", s[2][3]));
 
 // Section through the shell screw, seen from above. OpenCSG paints every cut face one colour, so

@@ -101,6 +101,19 @@ and an ImageMagick with PNG support.
 colours) and gets the sleeve, screw post, USB opening and side vents for free. `shells/plain.scad`
 is the only one so far. Its holes must open over the sensor pocket.
 
+## The gateway
+
+`gateway.scad`: the gateway Feather, on USB power on a shelf, in a 57 × 35 × 16 mm case. It
+reuses the node's board data and fits: the Feather screws to a base plate, component side up, and
+a cover drops over it and is held by one screw from underneath, flush in a counterbore.
+
+- Print `stl/gw_base.stl` flat and `stl/gw_cover.stl` top down, no supports.
+- 3 × M2.5 × 6 screws: two through the Feather's USB-end holes into the base, one up through the
+  base into the cover's post.
+- RESET and BOOT through funnelled holes in the top, as on a node. Air comes in low along the
+  sides and leaves through slots over the S3 module.
+- `part="gw_check"` intersects the Feather with both parts: it should come out empty.
+
 ## Not done yet
 
 - First core, shell and test pieces printed 2026-11-17. Fixed since, not yet printed: flared post

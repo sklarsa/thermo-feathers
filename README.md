@@ -140,7 +140,8 @@ fmt, and clippy with dummy secrets.
 
 ## Enclosure
 
-`just stl` rebuilds every STL in `enclosure/stl`; `just core <id>` makes a new node's core. See
+Nodes and the gateway each have a case. `just stl` rebuilds every STL in `enclosure/stl`;
+`just core <id>` makes a new node's core. See
 [enclosure/](enclosure/README.md).
 
 ## License
