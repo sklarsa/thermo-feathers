@@ -1,6 +1,6 @@
 // The gateway's case: a Feather on USB power, on a shelf. The Feather screws to a base plate,
-// component side up, and a cover drops over it, held by two screws from underneath into posts, one
-// near each end. Four M2.5 x 6 screws: two for the Feather, two for the cover.
+// component side up, and a cover drops over it, held by four screws from underneath into posts, one
+// in each corner. Six M2.5 x 6 screws: two for the Feather, four for the cover.
 //
 // Frame: x along the board (USB-C at the -x end), y across, z up from the shelf. The origin is the
 // inside corner of the cover's walls. Parts are built from main.scad: gw_base (flat on the bed),
@@ -14,12 +14,12 @@ gw_top_room = 1.5;     // over its tallest part, the 6 mm JST-PH
 gw_post_d = 6;
 
 gx = 0.3 + 1.14;                        // board origin: the USB face 0.3 inside the -x wall
-gy = 1;
+gw_side = 1 + gw_post_d + 1;           // a strip each side of the board for the cover's posts
+gy = gw_side;
 gz = base_t + gw_standoff + pcb;        // the component face
-gw_posts = [for (x = [gx + 5, gx + fw - 5]) [x, gy + fh + 1 + gw_post_d / 2]];   // beside the board, one near each end
-gw_post = gw_posts[0];
 gw_L = gx + fw + 1.5;
-gw_W = gw_post.y + gw_post_d / 2 + 1;
+gw_W = gy + fh + gw_side;
+gw_posts = [for (x = [4, gw_L - 4], y = [gw_side / 2, gw_W - gw_side / 2]) [x, y]];   // one in each corner
 gw_H = gz + 6 + gw_top_room + gw_t;
 echo(str("gateway case ", gw_L + 2 * gw_t, " x ", gw_W + 2 * gw_t, " x ", gw_H));
 
