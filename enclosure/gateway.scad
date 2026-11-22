@@ -9,7 +9,7 @@
 gw_t = 1.6;            // cover walls and top
 gw_r = 3;              // outside corner radius
 base_t = 2;
-gw_standoff = 3;       // under the board: its underside is bare
+gw_standoff = 4;       // under the board: a 6 mm screw through it stops 1 mm short of the pilot's end
 gw_top_room = 1.5;     // over its tallest part, the 6 mm JST-PH
 gw_post_d = 6;
 
@@ -42,8 +42,7 @@ module gw_base() difference() {
     }
     for (p = gw_posts) at(p, 0) cylinder(d = 7.5, h = 4, $fn = 32);   // the cover screws' bosses
   }
-  // through the base: a 6 mm screw under 1.6 mm of board reaches 0.6 mm from the bottom
-  for (h = f_screws) at(gpos(h), -1) cylinder(d = m25_pilot, h = 10, $fn = 24);
+  for (h = f_screws) at(gpos(h), 0.6) cylinder(d = m25_pilot, h = 10, $fn = 24);
   for (p = gw_posts) at(p, -1) {
     cylinder(d = screw_clear, h = 10, $fn = 24);
     cylinder(d = screw_head[0], h = 1 + screw_head[1], $fn = 32);   // flush, so it sits flat
