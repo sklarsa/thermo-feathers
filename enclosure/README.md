@@ -105,11 +105,12 @@ is the only one so far. Its holes must open over the sensor pocket.
 
 `gateway.scad`: the gateway Feather, on USB power on a shelf, in a 57 × 35 × 16 mm case. It
 reuses the node's board data and fits: the Feather screws to a base plate, component side up, and
-a cover drops over it and is held by one screw from underneath, flush in a counterbore.
+a cover drops over it and is held by two screws from underneath, one near each end, flush in
+counterbores.
 
 - Print `stl/gw_base.stl` flat and `stl/gw_cover.stl` top down, no supports.
-- 3 × M2.5 × 6 screws: two through the Feather's USB-end holes into the base, one up through the
-  base into the cover's post.
+- 4 × M2.5 × 6 screws: two through the Feather's USB-end holes into the base (their pilots go
+  right through, so a 6 mm screw can't bottom out), two up through the base into the cover's posts.
 - RESET and BOOT through funnelled holes in the top, as on a node. Air comes in low along the
   sides and leaves through slots over the S3 module.
 - `part="gw_check"` intersects the Feather with both parts: it should come out empty.

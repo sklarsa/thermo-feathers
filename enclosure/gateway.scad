@@ -1,6 +1,6 @@
 // The gateway's case: a Feather on USB power, on a shelf. The Feather screws to a base plate,
-// component side up, and a cover drops over it, held by one screw from underneath into a post, as
-// a node's shell is. Three M2.5 x 6 screws: two for the Feather, one for the cover.
+// component side up, and a cover drops over it, held by two screws from underneath into posts, one
+// near each end. Four M2.5 x 6 screws: two for the Feather, two for the cover.
 //
 // Frame: x along the board (USB-C at the -x end), y across, z up from the shelf. The origin is the
 // inside corner of the cover's walls. Parts are built from main.scad: gw_base (flat on the bed),
@@ -16,7 +16,8 @@ gw_post_d = 6;
 gx = 0.3 + 1.14;                        // board origin: the USB face 0.3 inside the -x wall
 gy = 1;
 gz = base_t + gw_standoff + pcb;        // the component face
-gw_post = [gx + 30, gy + fh + 1 + gw_post_d / 2];   // beside the board, clear of the JST-PH
+gw_posts = [for (x = [gx + 5, gx + fw - 5]) [x, gy + fh + 1 + gw_post_d / 2]];   // beside the board, one near each end
+gw_post = gw_posts[0];
 gw_L = gx + fw + 1.5;
 gw_W = gw_post.y + gw_post_d / 2 + 1;
 gw_H = gz + 6 + gw_top_room + gw_t;
@@ -39,10 +40,11 @@ module gw_base() difference() {
       cylinder(d = pin_d, h = gw_standoff + pcb + 0.8, $fn = 24);
       translate([0, 0, gw_standoff + pcb + 0.8]) cylinder(d1 = pin_d, d2 = pin_d - 0.8, h = 0.4, $fn = 24);
     }
-    at(gw_post, 0) cylinder(d = 7.5, h = 4, $fn = 32);   // the cover screw's boss
+    for (p = gw_posts) at(p, 0) cylinder(d = 7.5, h = 4, $fn = 32);   // the cover screws' bosses
   }
-  for (h = f_screws) at(gpos(h), 0.6) cylinder(d = m25_pilot, h = 10, $fn = 24);
-  at(gw_post, -1) {
+  // through the base: a 6 mm screw under 1.6 mm of board reaches 0.6 mm from the bottom
+  for (h = f_screws) at(gpos(h), -1) cylinder(d = m25_pilot, h = 10, $fn = 24);
+  for (p = gw_posts) at(p, -1) {
     cylinder(d = screw_clear, h = 10, $fn = 24);
     cylinder(d = screw_head[0], h = 1 + screw_head[1], $fn = 32);   // flush, so it sits flat
   }
@@ -55,10 +57,10 @@ module gw_cover() difference() {
       linear_extrude(gw_H) gw_outline();
       translate([0, 0, -1]) linear_extrude(gw_H - gw_t + 1) gw_outline(-gw_t);
     }
-    at(gw_post, 4.2) cylinder(d = gw_post_d, h = gw_H - gw_t - 4.2 + 0.01, $fn = 32);
+    for (p = gw_posts) at(p, 4.2) cylinder(d = gw_post_d, h = gw_H - gw_t - 4.2 + 0.01, $fn = 32);
     for (b = [f_reset, f_boot]) at(gpos(b), btn_z) cylinder(d = btn_d + 2, h = gw_H - btn_z - 0.01, $fn = 24);
   }
-  at(gw_post, 3) cylinder(d = m25_pilot, h = 8, $fn = 24);
+  for (p = gw_posts) at(p, 3) cylinder(d = m25_pilot, h = 8, $fn = 24);
   for (b = [f_reset, f_boot]) at(gpos(b), btn_z - 1) {
     cylinder(d = btn_d, h = 30, $fn = 24);
     translate([0, 0, gw_H - btn_z - 0.5]) cylinder(d1 = btn_d, d2 = btn_d + 3, h = 1.5 + 0.01, $fn = 24);   // funnel
