@@ -467,11 +467,14 @@ button{cursor:pointer;background:var(--fg);color:var(--bg);border-color:var(--fg
 const UNSAVE: &str = "<script>if(location.pathname.endsWith('/saved'))\
 history.replaceState(null,'',location.pathname.slice(0,-6)||'/')</script>";
 
-/// Swaps in fresh cards every 30 s, unless a rename is open or the tab is hidden.
-const REFRESH: &str = "<script>setInterval(async()=>{if(document.hidden||\
-document.querySelector('details[open]'))return;try{const t=await(await fetch('/')).text();\
+/// Swaps in fresh cards every 30 s, and on coming back to the tab, unless a rename is open or the
+/// tab is hidden. Each fetch gives up after 10 s: one left hanging (its reply lost, say) holds a
+/// connection for good, and once the browser's few per host are held, every later refresh waits.
+const REFRESH: &str = "<script>const refresh=async()=>{if(document.hidden||\
+document.querySelector('details[open]'))return;try{const t=await(await fetch('/',{signal:AbortSignal.timeout(10000)})).text();\
 const n=new DOMParser().parseFromString(t,'text/html').getElementById('rooms');\
-if(n)document.getElementById('rooms').replaceWith(n)}catch(e){}},30000)</script>";
+if(n)document.getElementById('rooms').replaceWith(n)}catch(e){}};\
+setInterval(refresh,30000);document.addEventListener('visibilitychange',refresh)</script>";
 
 /// Sends a chosen file as the raw body: node firmware to `POST /update?to=<ids>`, gateway firmware
 /// to `POST /update/gateway`.
